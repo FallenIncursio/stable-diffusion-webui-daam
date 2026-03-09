@@ -1,28 +1,54 @@
 from __future__ import annotations
-from collections import defaultdict
 import os
 import re
-import traceback
 
 import gradio as gr
 import modules.images as images
 import modules.scripts as scripts
 import torch
-from ldm.modules.encoders.modules import FrozenCLIPEmbedder, FrozenOpenCLIPEmbedder
-import sgm
-from sgm.modules import GeneralConditioner
-import open_clip.tokenizer
 from modules import script_callbacks
-from modules import script_callbacks, sd_hijack_clip, sd_hijack_open_clip
-from modules.processing import (Processed, StableDiffusionProcessing, fix_seed,
-                                process_images)
-from modules.shared import cmd_opts, opts, state
+from modules.processing import StableDiffusionProcessing, fix_seed
+from modules.shared import opts
 import modules.shared as shared
 from PIL import Image
 
 from scripts.daam import trace, utils
 
 before_image_saved_handler = None
+
+
+def _resolve_text_engine(sd_model):
+    for attr in ("text_processing_engine", "text_processing_engine_l", "text_processing_engine_g"):
+        engine = getattr(sd_model, attr, None)
+        if engine is not None:
+            return engine
+
+    cond_stage_model = getattr(sd_model, "cond_stage_model", None)
+    if cond_stage_model is None:
+        return None
+
+    if hasattr(cond_stage_model, "tokenize_line") or hasattr(cond_stage_model, "tokenize"):
+        return cond_stage_model
+
+    embedders = getattr(cond_stage_model, "embedders", None)
+    if isinstance(embedders, (list, tuple)) and len(embedders) > 0:
+        return embedders[0]
+
+    return None
+
+
+def _resolve_diffusion_model(sd_model):
+    if hasattr(sd_model, "model") and hasattr(sd_model.model, "diffusion_model"):
+        return sd_model.model.diffusion_model
+
+    forge_objects = getattr(sd_model, "forge_objects", None)
+    if forge_objects is not None:
+        unet = getattr(forge_objects, "unet", None)
+        if unet is not None and hasattr(unet, "model") and hasattr(unet.model, "diffusion_model"):
+            return unet.model.diffusion_model
+
+    raise AttributeError(f"Unsupported model structure for DAAM tracing: {type(sd_model)}")
+
 
 class Script(scripts.Script):
     
@@ -37,9 +63,107 @@ class Script(scripts.Script):
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
+    def _safe_unhook_tracers(self):
+        if self.tracers is None:
+            return
+        for tracer in self.tracers:
+            if getattr(tracer, "hooked", False):
+                tracer.unhook()
+
+    @staticmethod
+    def _is_dummy_postprocess_call(processed):
+        images_list = getattr(processed, "images", None)
+        return isinstance(images_list, list) and len(images_list) == 0
+
+    @staticmethod
+    def _extract_seed_from_filename(filename):
+        if not filename:
+            return None
+        basename = os.path.basename(filename)
+        match = re.search(r"^\d+-(\d+)", basename)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _extract_batch_pos_from_pnginfo(pnginfo):
+        if not isinstance(pnginfo, dict):
+            return None
+        params_text = pnginfo.get("parameters", "")
+        for pattern in (r"Batch pos: (\d+)", r"Batch index: (\d+)", r"Batch position: (\d+)"):
+            match = re.search(pattern, params_text)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    return None
+        return None
+
+    @staticmethod
+    def _is_grid_save(params):
+        filename = os.path.abspath(getattr(params, "filename", "") or "")
+        basename = os.path.basename(filename).lower()
+        if basename.startswith("grid-") or basename.startswith("grid_") or basename.startswith("griddaam") or basename.startswith("grid_daam"):
+            return True
+
+        p = getattr(params, "p", None)
+        grid_dir = os.path.abspath(getattr(p, "outpath_grids", "") or "")
+        if filename and grid_dir:
+            try:
+                if os.path.commonpath([filename, grid_dir]) == grid_dir:
+                    return True
+            except ValueError:
+                return False
+        return False
+
+    def _index_in_seed_list(self, seed_list, seed):
+        if not isinstance(seed_list, (list, tuple)):
+            return None
+        for idx, value in enumerate(seed_list):
+            try:
+                if int(value) == seed:
+                    return idx
+            except Exception:
+                continue
+        return None
+
+    def _resolve_batch_pos(self, params):
+        p = getattr(params, "p", None)
+        batch_size = max(int(getattr(p, "batch_size", 1) or 1), 1)
+
+        # Preferred path on modern Forge: processing keeps a batch_index on each sample save.
+        batch_index = getattr(p, "batch_index", None)
+        if isinstance(batch_index, int) and batch_index >= 0:
+            return batch_index % batch_size
+
+        # Legacy metadata-based fallback used by older A1111 variants.
+        batch_pos = self._extract_batch_pos_from_pnginfo(getattr(params, "pnginfo", None))
+        if isinstance(batch_pos, int) and batch_pos >= 0:
+            return batch_pos % batch_size
+
+        # Resolve from seed filename against processing seed lists.
+        seed = self._extract_seed_from_filename(getattr(params, "filename", ""))
+        if seed is not None:
+            all_seeds = getattr(p, "all_seeds", None)
+            idx = self._index_in_seed_list(all_seeds, seed)
+            if isinstance(idx, int):
+                return idx % batch_size
+
+            seeds = getattr(p, "seeds", None)
+            idx = self._index_in_seed_list(seeds, seed)
+            if isinstance(idx, int):
+                return idx % batch_size
+
+        # Last-resort fallback: monotonically assign save callbacks into batch slots.
+        return self.saved_sample_count % batch_size
+
     def ui(self, is_img2img):
         with gr.Group():
             with gr.Accordion("Attention Heatmap", open=False):
+                enable_daam = gr.Checkbox(label='Enable DAAM', value=False)
                 attention_texts = gr.Text(label='Attention texts for visualization. (comma separated)', value='')
 
                 with gr.Row():
@@ -69,8 +193,10 @@ class Script(scripts.Script):
         
         
         self.tracers = None
+        self.run_active = False
         
-        return [attention_texts, hide_images, dont_save_images, hide_caption, use_grid, grid_layouyt, alpha, heatmap_image_scale, trace_each_layers, layers_as_row] 
+        # Keep toggle as the last arg for API backward compatibility.
+        return [attention_texts, hide_images, dont_save_images, hide_caption, use_grid, grid_layouyt, alpha, heatmap_image_scale, trace_each_layers, layers_as_row, enable_daam] 
     
     def process(self, 
             p : StableDiffusionProcessing, 
@@ -83,8 +209,15 @@ class Script(scripts.Script):
             alpha : float, 
             heatmap_image_scale : float,
             trace_each_layers : bool,
-            layers_as_row: bool):
-        
+            layers_as_row: bool,
+            enable_daam: bool = True):
+        attentions = [s.strip() for s in attention_texts.split(",") if s.strip()]
+
+        # ADetailer can trigger nested script.process() calls during a running txt2img pass.
+        # Do not reset DAAM state in that case, otherwise accumulated batch heatmaps are lost.
+        if enable_daam and attentions and getattr(self, "run_active", False) and self.tracers is not None:
+            return
+
         self.enabled = False # in case the assert fails
         assert opts.samples_save, "Cannot run Daam script. Enable 'Always save all generated images' setting."
 
@@ -97,9 +230,19 @@ class Script(scripts.Script):
         self.grid_layouyt = grid_layouyt
         self.heatmap_image_scale = heatmap_image_scale
         self.heatmap_images = dict()
+        self.deferred_cleanup = False
+        self.saved_sample_count = 0
 
-        self.attentions = [s.strip() for s in attention_texts.split(",") if s.strip()]
-        self.enabled = len(self.attentions) > 0
+        self.attentions = attentions
+        self.enabled = bool(enable_daam) and len(self.attentions) > 0
+        self.run_active = self.enabled
+
+        if not self.enabled:
+            self._safe_unhook_tracers()
+            self.tracers = None
+            global before_image_saved_handler
+            before_image_saved_handler = None
+            return
 
         fix_seed(p)
         
@@ -115,53 +258,48 @@ class Script(scripts.Script):
             heatmap_image_scale : float,
             trace_each_layers : bool,
             layers_as_row: bool,
-            prompts,
+            *extra_args,
+            prompts=None,
             **kwargs):
-                
+        enable_daam = True
+        if len(extra_args) > 0 and isinstance(extra_args[0], bool):
+            enable_daam = extra_args[0]
+
+        if prompts is None:
+            # Some call paths pass prompts positionally after script args.
+            if len(extra_args) > 0 and not isinstance(extra_args[0], bool):
+                prompts = extra_args[0]
+            elif len(extra_args) > 1 and isinstance(extra_args[0], bool):
+                prompts = extra_args[1]
+            else:
+                prompts = kwargs.get("prompts", None)
+
+        if not enable_daam:
+            return
+                 
         if not self.enabled:
             return
         
-        styled_prompt = prompts[0]         
-        
-        embedder = None
-        if type(p.sd_model.cond_stage_model) == sd_hijack_clip.FrozenCLIPEmbedderWithCustomWords or \
-            type(p.sd_model.cond_stage_model) == sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords:
-            embedder = p.sd_model.cond_stage_model  
-        elif type(p.sd_model.cond_stage_model) == GeneralConditioner:    
-            conditioner = p.sd_model.cond_stage_model
-            print(conditioner.embedders)
-            embedder = conditioner.embedders[0]
-        else:
-            assert False, f"Embedder '{type(p.sd_model.cond_stage_model)}' is not supported."
-            
-        clip = None
-        tokenize = None
-        clip_type = type(embedder.wrapped)
-        if clip_type == FrozenCLIPEmbedder:
-            clip : FrozenCLIPEmbedder = embedder.wrapped
-            tokenize = clip.tokenizer.tokenize
-        elif clip_type == FrozenOpenCLIPEmbedder:
-            clip : FrozenOpenCLIPEmbedder = embedder.wrapped
-            tokenize = open_clip.tokenizer._tokenizer.encode
-        elif clip_type == sgm.modules.encoders.modules.FrozenCLIPEmbedder:
-            clip : sgm.modules.encoders.modules.FrozenCLIPEmbedder = embedder.wrapped
-            tokenize = clip.tokenizer.tokenize
-        else:
-            assert False, f"CLIP '{clip_type}' is not supported."
-            
-        tokens = tokenize(utils.escape_prompt(styled_prompt))
-        context_size = utils.calc_context_size(len(tokens))
-        
-        prompt_analyzer = utils.PromptAnalyzer(embedder, styled_prompt)
+        if not prompts:
+            return
+
+        styled_prompt = prompts[0]
+
+        text_engine = _resolve_text_engine(p.sd_model)
+        assert text_engine is not None, f"DAAM does not support this text encoder: {type(getattr(p.sd_model, 'cond_stage_model', None))}"
+
+        prompt_analyzer = utils.PromptAnalyzer(text_engine, styled_prompt)
         self.prompt_analyzer = prompt_analyzer
         context_size = prompt_analyzer.context_size
-               
+
+        diffusion_model = _resolve_diffusion_model(p.sd_model)
+                
         print(f"daam run with context_size={prompt_analyzer.context_size}, token_count={prompt_analyzer.token_count}")
         print(f"remade_tokens={prompt_analyzer.tokens}, multipliers={prompt_analyzer.multipliers}")
         print(f"hijack_comments={prompt_analyzer.hijack_comments}, used_custom_terms={prompt_analyzer.used_custom_terms}")
         print(f"fixes={prompt_analyzer.fixes}")
         
-        if any(item[0] in self.attentions for item in self.prompt_analyzer.used_custom_terms):
+        if any(isinstance(item, (list, tuple)) and len(item) > 0 and item[0] in self.attentions for item in self.prompt_analyzer.used_custom_terms):
             print("Embedding heatmap cannot be shown.")
             
         global before_image_saved_handler
@@ -169,11 +307,14 @@ class Script(scripts.Script):
                 
         with torch.no_grad():
             # cannot trace the same block from two tracers
-            if trace_each_layers:
-                num_input = len(p.sd_model.model.diffusion_model.input_blocks)
-                num_output = len(p.sd_model.model.diffusion_model.output_blocks)
-                self.tracers = [trace(p.sd_model, p.height, p.width, context_size, layer_idx=i) for i in range(num_input + num_output + 1)]
-                self.attn_captions = [f"IN{i:02d}" for i in range(num_input)] + ["MID"] + [f"OUT{i:02d}" for i in range(num_output)]
+            num_input = len(getattr(diffusion_model, "input_blocks", []))
+            num_output = len(getattr(diffusion_model, "output_blocks", []))
+            has_middle = 1 if hasattr(diffusion_model, "middle_block") else 0
+
+            if trace_each_layers and (num_input + num_output + has_middle) > 0:
+                layer_count = num_input + num_output + has_middle
+                self.tracers = [trace(p.sd_model, p.height, p.width, context_size, layer_idx=i) for i in range(layer_count)]
+                self.attn_captions = [f"IN{i:02d}" for i in range(num_input)] + (["MID"] if has_middle else []) + [f"OUT{i:02d}" for i in range(num_output)]
             else:
                 self.tracers = [trace(p.sd_model, p.height, p.width, context_size)]
                 self.attn_captions = [""]
@@ -192,13 +333,23 @@ class Script(scripts.Script):
             heatmap_image_scale : float,
             trace_each_layers : bool,
             layers_as_row: bool,
+            enable_daam: bool = True,
             **kwargs):
         if self.enabled == False:
             return
+
+        # ADetailer calls `scripts.postprocess(copy(p), Processed(..., images=[]))`
+        # inside its postprocess_image hook before the final save.
+        # If we fully finalize here, DAAM is disabled for the real output image.
+        if self._is_dummy_postprocess_call(processed):
+            self._safe_unhook_tracers()
+            self.deferred_cleanup = True
+            return processed
         
-        for trace in self.tracers:
-            trace.unhook()
+        self._safe_unhook_tracers()
         self.tracers = None
+        self.deferred_cleanup = False
+        self.run_active = False
         
         initial_info = None
 
@@ -242,7 +393,7 @@ class Script(scripts.Script):
                         rows = p.batch_size * p.n_iter
                     grid_img = images.image_grid(img_list, batch_size=batch_size, rows=rows)
                 else:
-                    pass
+                    continue
                 
                 if not self.dont_save_images:
                     images.save_image(grid_img, p.outpath_grids, "grid_daam", grid=True, p=p)
@@ -261,24 +412,21 @@ class Script(scripts.Script):
         return processed
     
     def before_image_saved(self, params : script_callbacks.ImageSaveParams):               
-        batch_pos = -1
-        if params.p.batch_size > 1:
-            match  = re.search(r"Batch pos: (\d+)", params.pnginfo['parameters'])
-            if match:
-                batch_pos = int(match.group(1))
-        else:
-            batch_pos = 0
-            
-        if batch_pos < 0:
+        if self._is_grid_save(params):
             return        
+
+        batch_pos = self._resolve_batch_pos(params)
+        if batch_pos < 0:
+            return
         
         if self.tracers is not None and len(self.attentions) > 0:
             for i, tracer in enumerate(self.tracers):
                 with torch.no_grad():
-                    styled_prompot = shared.prompt_styles.apply_styles_to_prompt(params.p.prompt, params.p.styles)
+                    prompt_text = params.p.prompt[0] if isinstance(params.p.prompt, list) else params.p.prompt
+                    styled_prompt = shared.prompt_styles.apply_styles_to_prompt(prompt_text, params.p.styles)
                     try:
-                        global_heat_map = tracer.compute_global_heat_map(self.prompt_analyzer, styled_prompot, batch_pos)              
-                    except:
+                        global_heat_map = tracer.compute_global_heat_map(self.prompt_analyzer, styled_prompt, batch_pos)              
+                    except Exception:
                         continue
                     
                     if i not in self.heatmap_images:
@@ -289,7 +437,8 @@ class Script(scripts.Script):
                         for attention in self.attentions:
                                     
                             img_size = params.image.size
-                            caption = attention + (" " + self.attn_captions[i] if self.attn_captions[i] else "") if not self.hide_caption else None
+                            attn_caption = self.attn_captions[i] if i < len(self.attn_captions) else ""
+                            caption = attention + (" " + attn_caption if attn_caption else "") if not self.hide_caption else None
                             
                             heat_map = global_heat_map.compute_word_heat_map(attention)
                             if heat_map is None : print(f"No heatmaps for '{attention}'")
@@ -298,7 +447,7 @@ class Script(scripts.Script):
                             img : Image.Image = utils.image_overlay_heat_map(params.image, heat_map_img, alpha=self.alpha, caption=caption, image_scale=self.heatmap_image_scale)
 
                             fullfn_without_extension, extension = os.path.splitext(params.filename) 
-                            full_filename = fullfn_without_extension + "_" + attention +  ("_" + self.attn_captions[i] if self.attn_captions[i] else "") + extension
+                            full_filename = fullfn_without_extension + "_" + attention +  ("_" + attn_caption if attn_caption else "") + extension
                             
                             if self.use_grid:
                                 heatmap_images.append(img)
@@ -312,9 +461,11 @@ class Script(scripts.Script):
         self.heatmap_images = {j:self.heatmap_images[j] for j in self.heatmap_images.keys() if self.heatmap_images[j]}
 
         # if it is last batch pos, clear heatmaps
-        if batch_pos == params.p.batch_size - 1:
+        if self.tracers is not None and batch_pos == params.p.batch_size - 1:
             for tracer in self.tracers:
                 tracer.reset()
+
+        self.saved_sample_count += 1
             
         return
 

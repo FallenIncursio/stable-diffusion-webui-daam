@@ -1,12 +1,16 @@
 from __future__ import annotations
-from typing import List, Generic, TypeVar, Callable, Union, Any
+from typing import List, Generic, TypeVar, Any
 import functools
 import itertools
-from ldm.modules.attention import SpatialTransformer
 
-from ldm.modules.diffusionmodules.openaimodel import UNetModel
-from ldm.modules.attention import CrossAttention
 import torch.nn as nn
+
+try:
+    from ldm.modules.diffusionmodules.openaimodel import UNetModel
+    from ldm.modules.attention import CrossAttention
+except ModuleNotFoundError:
+    from backend.nn.unet import CrossAttention
+    UNetModel = Any
 
 
 __all__ = ['ObjectHooker', 'ModuleLocator', 'AggregateHooker', 'UNetCrossAttentionLocator']
@@ -85,7 +89,7 @@ class AggregateHooker(ObjectHooker[ModuleListType]):
 
 
 class UNetCrossAttentionLocator(ModuleLocator[CrossAttention]):
-    def locate(self, model: UNetModel, layer_idx: int) -> List[CrossAttention]:
+    def locate(self, model: UNetModel, layer_idx: int = None) -> List[CrossAttention]:
         """
         Locate all cross-attention modules in a UNetModel.
 
@@ -98,8 +102,7 @@ class UNetCrossAttentionLocator(ModuleLocator[CrossAttention]):
         blocks = []
         
         for i, unet_block in enumerate(itertools.chain(model.input_blocks, [model.middle_block], model.output_blocks)):
-            # if 'CrossAttn' in unet_block.__class__.__name__:
-            if not layer_idx or i == layer_idx:
+            if layer_idx is None or i == layer_idx:
                 for module in unet_block.modules():
                     if module.__class__.__name__ == "SpatialTransformer":
                         spatial_transformer = module
