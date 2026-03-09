@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 import random
 import re
-from typing import Union
+from typing import Union, Any
 
 from PIL import Image, ImageFont, ImageDraw
 # from fonts.ttf import Roboto
@@ -17,12 +17,29 @@ import torch
 import torch.nn.functional as F
 from modules.devices import dtype
 
-from ldm.modules.encoders.modules import FrozenCLIPEmbedder, FrozenOpenCLIPEmbedder
 import open_clip.tokenizer
-from modules.sd_hijack_clip import FrozenCLIPEmbedderWithCustomWordsBase, FrozenCLIPEmbedderWithCustomWords
-from modules.sd_hijack_open_clip import FrozenOpenCLIPEmbedderWithCustomWords
-from modules.shared import opts
-from sgm.modules import GeneralConditioner
+
+try:
+    from ldm.modules.encoders.modules import FrozenCLIPEmbedder, FrozenOpenCLIPEmbedder
+except ModuleNotFoundError:
+    FrozenCLIPEmbedder = None
+    FrozenOpenCLIPEmbedder = None
+
+try:
+    from modules.sd_hijack_clip import FrozenCLIPEmbedderWithCustomWordsBase, FrozenCLIPEmbedderWithCustomWords
+except Exception:
+    FrozenCLIPEmbedderWithCustomWordsBase = object
+    FrozenCLIPEmbedderWithCustomWords = object
+
+try:
+    from modules.sd_hijack_open_clip import FrozenOpenCLIPEmbedderWithCustomWords
+except Exception:
+    FrozenOpenCLIPEmbedderWithCustomWords = object
+
+try:
+    from sgm.modules import GeneralConditioner
+except ModuleNotFoundError:
+    GeneralConditioner = object
 
 __all__ = ['expand_image', 'set_seed', 'escape_prompt', 'calc_context_size', 'compute_token_merge_indices', 'compute_token_merge_indices_with_tokenizer', 'image_overlay_heat_map', 'plot_overlay_heat_map', 'plot_mask_heat_map', 'PromptAnalyzer']
 
@@ -67,6 +84,11 @@ def image_overlay_heat_map(img, heat_map, word=None, out_file=None, crop=None, a
         heat_map = _convert_heat_map_colors(heat_map)
         heat_map = heat_map.to('cpu').detach().numpy().copy().astype(np.uint8)
         heat_map_img = Image.fromarray(heat_map)
+
+        if heat_map_img.size != img.size:
+            heat_map_img = heat_map_img.resize(img.size, Image.BICUBIC)
+        if heat_map_img.mode != img.mode:
+            heat_map_img = heat_map_img.convert(img.mode)
 
         img = Image.blend(img, heat_map_img, alpha)
     else:
@@ -155,14 +177,18 @@ def compute_token_merge_indices(model, prompt: str, word: str, word_idx: int = N
 
     clip = None
     tokenize = None
-    if type(model.cond_stage_model.wrapped) == FrozenCLIPEmbedder:
+    wrapped = getattr(getattr(model, "cond_stage_model", None), "wrapped", None)
+
+    if FrozenCLIPEmbedder is not None and isinstance(wrapped, FrozenCLIPEmbedder):
         clip : FrozenCLIPEmbedder = model.cond_stage_model.wrapped
         tokenize = clip.tokenizer.tokenize
-    elif type(model.cond_stage_model.wrapped) == FrozenOpenCLIPEmbedder:
+    elif FrozenOpenCLIPEmbedder is not None and isinstance(wrapped, FrozenOpenCLIPEmbedder):
         clip : FrozenOpenCLIPEmbedder = model.cond_stage_model.wrapped
         tokenize = open_clip.tokenizer._tokenizer.encode
+    elif wrapped is not None and hasattr(wrapped, "tokenizer"):
+        tokenize = wrapped.tokenizer.tokenize
     else:
-        assert False
+        raise AssertionError(f"Unsupported encoder type for token merge indices: {type(wrapped)}")
 
     escaped_prompt = escape_prompt(prompt)
     # escaped_prompt = re.sub(r"[_-]", " ", escaped_prompt)
@@ -264,49 +290,77 @@ def cached_nlp(prompt: str, type='en_core_web_md'):
     return nlp(prompt)
 
 class PromptAnalyzer:
-    def __init__(self, clip : Union[FrozenCLIPEmbedderWithCustomWordsBase, GeneralConditioner], text : str):
-        use_old = opts.use_old_emphasis_implementation
-        assert not use_old, "use_old_emphasis_implementation is not supported"
+    class _SimpleChunk:
+        def __init__(self, tokens):
+            self.tokens = tokens
+            self.multipliers = [1.0] * len(tokens)
+            self.fixes = []
+
+    def __init__(self, clip: Any, text: str):
 
         self.clip = clip
-        # self.id_start = clip.id_start
-        # self.id_end = clip.id_end
-        self.is_open_clip = True if type(clip) == FrozenOpenCLIPEmbedderWithCustomWords else False
-        self.is_sdxl = True if type(clip) == GeneralConditioner else False
+        self.is_open_clip = isinstance(clip, FrozenOpenCLIPEmbedderWithCustomWords)
+        self.is_sdxl = isinstance(clip, GeneralConditioner)
         self.used_custom_terms = []
         self.hijack_comments = []
+        self.raw_text = text
+        self.analysis_text = text
 
-        chunks, token_count = self.tokenize_line(text)
+        chunks, token_count = self.tokenize_line(self.analysis_text)
 
-        self.token_count = token_count
-        self.fixes = list(chain.from_iterable(chunk.fixes for chunk in chunks))
-        self.context_size = calc_context_size(token_count)
+        self.token_count = token_count if token_count is not None else 0
+        self.fixes = list(chain.from_iterable(getattr(chunk, "fixes", []) for chunk in chunks))
 
-        tokens = list(chain.from_iterable(chunk.tokens for chunk in chunks))
-        multipliers = list(chain.from_iterable(chunk.multipliers for chunk in chunks))
-        print(tokens, multipliers)
-        print(len(tokens), len(multipliers))
+        tokens = list(chain.from_iterable(getattr(chunk, "tokens", []) for chunk in chunks))
+        multipliers = list(chain.from_iterable(getattr(chunk, "multipliers", []) for chunk in chunks))
 
-        self.tokens = tokens # []
-        self.multipliers = multipliers # []
-        # for i in range(self.context_size // 77):
-        #     self.tokens.extend([self.id_start] + tokens[i*75:i*75+75] + [self.id_end])
-        #     self.multipliers.extend([1.0] + multipliers[i*75:i*75+75]+ [1.0])
+        if self.token_count <= 0:
+            self.token_count = len(tokens)
+        self.context_size = calc_context_size(self.token_count)
+
+        if len(multipliers) == 0 and len(tokens) > 0:
+            multipliers = [1.0] * len(tokens)
+
+        self.tokens = tokens
+        self.multipliers = multipliers
 
     def create(self, text : str):
         return PromptAnalyzer(self.clip, text)
 
     def tokenize_line(self, line):
-        chunks, token_count = self.clip.tokenize_line(line)
-        return chunks, token_count
+        if hasattr(self.clip, "tokenize_line"):
+            chunks, token_count = self.clip.tokenize_line(line)
+            return chunks, token_count
+
+        tokens = self.encode(line)
+        chunk = PromptAnalyzer._SimpleChunk(tokens)
+        return [chunk], len(tokens)
 
     def process_text(self, texts):
-        batch_multipliers, remade_batch_tokens, used_custom_terms, hijack_comments, hijack_fixes, token_count = self.clip.process_text(texts)
-        print(batch_multipliers, remade_batch_tokens, used_custom_terms, hijack_comments, hijack_fixes, token_count)
-        return batch_multipliers, remade_batch_tokens, used_custom_terms, hijack_comments, hijack_fixes, token_count
+        if hasattr(self.clip, "process_text"):
+            return self.clip.process_text(texts)
+        if hasattr(self.clip, "process_texts"):
+            return self.clip.process_texts(texts)
+        return None
 
     def encode(self, text : str):
-        return self.clip.tokenize([text])[0]
+        if hasattr(self.clip, "tokenize"):
+            tokenized = self.clip.tokenize([text])
+            return tokenized[0] if len(tokenized) > 0 else []
+
+        tokenizer = getattr(self.clip, "tokenizer", None)
+        if tokenizer is None:
+            return []
+
+        if hasattr(tokenizer, "tokenize"):
+            return tokenizer.tokenize(text)
+
+        if callable(tokenizer):
+            output = tokenizer([text], truncation=False, add_special_tokens=False)
+            if isinstance(output, dict) and "input_ids" in output and len(output["input_ids"]) > 0:
+                return output["input_ids"][0]
+
+        return []
 
     def calc_word_indecies(self, word : str, limit : int = -1, start_pos = 0):
         word = word.lower()
@@ -314,6 +368,8 @@ class PromptAnalyzer:
 
         tokens = self.tokens
         needles = self.encode(word)
+        if len(needles) == 0:
+            return [], start_pos
 
         limit_count = 0
         current_pos = 0

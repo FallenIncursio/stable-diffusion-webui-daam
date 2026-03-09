@@ -6,9 +6,14 @@ from typing import List, Type, Any, Literal, Dict
 import math
 from modules.devices import device
 
-from ldm.models.diffusion.ddpm import DiffusionWrapper, LatentDiffusion
-from ldm.modules.diffusionmodules.openaimodel import UNetModel
-from ldm.modules.attention import CrossAttention, default, exists
+try:
+    from ldm.models.diffusion.ddpm import LatentDiffusion
+    from ldm.modules.diffusionmodules.openaimodel import UNetModel
+    from ldm.modules.attention import CrossAttention, default, exists
+except ModuleNotFoundError:
+    from backend.nn.unet import CrossAttention, default, exists
+    LatentDiffusion = Any
+    UNetModel = Any
 
 import numba
 import numpy as np
@@ -23,6 +28,19 @@ from .utils import compute_token_merge_indices, PromptAnalyzer
 
 
 __all__ = ['trace', 'DiffusionHeatMapHooker', 'HeatMap', 'MmDetectHeatMap']
+
+
+def _resolve_diffusion_model(model):
+    if hasattr(model, "model") and hasattr(model.model, "diffusion_model"):
+        return model.model.diffusion_model
+
+    forge_objects = getattr(model, "forge_objects", None)
+    if forge_objects is not None:
+        unet = getattr(forge_objects, "unet", None)
+        if unet is not None and hasattr(unet, "model") and hasattr(unet.model, "diffusion_model"):
+            return unet.model.diffusion_model
+
+    raise AttributeError(f"Unsupported model structure for DAAM tracing: {type(model)}")
 
 
 class UNetForwardHooker(ObjectHooker[UNetModel]):
@@ -98,9 +116,10 @@ class MmDetectHeatMap:
 
 class DiffusionHeatMapHooker(AggregateHooker):
     def __init__(self, model: LatentDiffusion, heigth : int, width : int, context_size : int = 77, weighted: bool = False, layer_idx: int = None, head_idx: int = None):
+        diffusion_model = _resolve_diffusion_model(model)
         heat_maps = defaultdict(lambda: defaultdict(list)) # batch index, factor, attention
-        modules = [UNetCrossAttentionHooker(x, heigth, width, heat_maps, context_size=context_size, weighted=weighted, head_idx=head_idx) for x in UNetCrossAttentionLocator().locate(model.model.diffusion_model, layer_idx)]
-        self.forward_hook = UNetForwardHooker(model.model.diffusion_model, heat_maps)
+        modules = [UNetCrossAttentionHooker(x, heigth, width, heat_maps, context_size=context_size, weighted=weighted, head_idx=head_idx) for x in UNetCrossAttentionLocator().locate(diffusion_model, layer_idx)]
+        self.forward_hook = UNetForwardHooker(diffusion_model, heat_maps)
         modules.append(self.forward_hook)
         
         self.height = heigth
@@ -117,8 +136,11 @@ class DiffusionHeatMapHooker(AggregateHooker):
         return self.forward_hook.all_heat_maps
     
     def reset(self):
-        map(lambda module: module.reset(), self.module)
-        return self.forward_hook.all_heat_maps.clear()
+        for module in self.module:
+            if hasattr(module, "reset"):
+                module.reset()
+        self.forward_hook.all_heat_maps.clear()
+        return
 
     def compute_global_heat_map(self, prompt_analyzer, prompt, batch_index, time_weights=None, time_idx=None, last_n=None, first_n=None, factors=None):
         # type: (PromptAnalyzer, str, int, int, int, int, int, List[float]) -> HeatMap
@@ -179,6 +201,9 @@ class DiffusionHeatMapHooker(AggregateHooker):
             if  len(merge_list) > 0:
                all_merges.append(merge_list)
 
+        if len(all_merges) == 0:
+            return None
+
         maps = torch.stack([torch.stack(x, 0) for x in all_merges], dim=0)
         maps = maps.sum(0).to(device).sum(2).sum(0)
 
@@ -195,10 +220,36 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         self.img_height = img_height
         self.img_width =  img_width
         self.calledCount = 0
+        self.cond_or_uncond = None
+        self.current_batch_size = None
         
     def reset(self):
         self.heat_maps.clear()
         self.calledCount = 0
+        self.cond_or_uncond = None
+        self.current_batch_size = None
+
+    def _infer_spatial_hw(self, token_count: int):
+        if token_count <= 0:
+            return 1, 1
+
+        target_ratio = self.img_width / max(self.img_height, 1)
+        best_h, best_w = token_count, 1
+        best_err = float("inf")
+        limit = int(math.sqrt(token_count)) + 1
+
+        for h in range(1, limit):
+            if token_count % h != 0:
+                continue
+
+            w = token_count // h
+            for hh, ww in ((h, w), (w, h)):
+                err = abs((ww / max(hh, 1)) - target_ratio)
+                if err < best_err:
+                    best_err = err
+                    best_h, best_w = hh, ww
+
+        return best_h, best_w
         
     @torch.no_grad()
     def _up_sample_attn(self, x, value, factor, method='bicubic'):
@@ -219,14 +270,13 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         weight = torch.full((factor, factor), 1 / factor ** 2, device=x.device)
         weight = weight.view(1, 1, factor, factor)
         
-        h = int(math.sqrt ( (self.img_height * x.size(1)) / self.img_width))
-        w = int(self.img_width * h / self.img_height)
+        h, w = self._infer_spatial_hw(x.size(1))
         
         h_fix = w_fix = 64
         if h >= w:
-            w_fix = int((w * h_fix) / h)
+            w_fix = max(1, int((w * h_fix) / h))
         else:
-            h_fix = int((h * w_fix) / w)
+            h_fix = max(1, int((h * w_fix) / w))
                 
         maps = []
         x = x.permute(2, 0, 1)
@@ -253,7 +303,8 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
 
         return (weights * maps).sum(1, keepdim=True).cpu()
     
-    def _forward(hk_self, self, x, context=None, mask=None, additional_tokens=None):
+    def _forward(hk_self, self, x, context=None, value=None, mask=None, additional_tokens=None, transformer_options=None, **kwargs):
+        n_tokens_to_mask = 0
         
         if additional_tokens is not None:
             # get the number of masked tokens at the beginning of the output sequence
@@ -262,19 +313,29 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             x = torch.cat([additional_tokens, x], dim=1)
         
         hk_self.calledCount += 1
+        if isinstance(transformer_options, dict):
+            hk_self.cond_or_uncond = transformer_options.get("cond_or_uncond", None)
+        else:
+            hk_self.cond_or_uncond = None
+
         batch_size, sequence_length, _ = x.shape
+        hk_self.current_batch_size = batch_size
         h = self.heads
+        scale = getattr(self, "scale", (self.dim_head ** -0.5))
 
         q = self.to_q(x)
         context = default(context, x)
         k = self.to_k(context)
-        v = self.to_v(context)
+        if value is not None:
+            v = self.to_v(value)
+        else:
+            v = self.to_v(context)
         
         dim = q.shape[-1]
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        sim = einsum('b i d, b j d -> b i j', q, k) * scale
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
@@ -282,13 +343,53 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             mask = repeat(mask, 'b j -> (b h) () j', h=h)
             sim.masked_fill_(~mask, max_neg_value)
         
-        out = hk_self._hooked_attention(self, q, k, v, batch_size, sequence_length, dim)
+        out = hk_self._hooked_attention(self, q, k, v, batch_size, sequence_length, dim, n_tokens_to_mask=n_tokens_to_mask)
         
         if additional_tokens is not None:
             # remove additional token
             out = out[:, n_tokens_to_mask:]
         
         return self.to_out(out)
+
+    def _resolve_cond_batch_index(self, batch_index: int):
+        cond_or_uncond = self.cond_or_uncond
+        if isinstance(cond_or_uncond, (list, tuple)):
+            markers = list(cond_or_uncond)
+            batch_size = self.current_batch_size if isinstance(self.current_batch_size, int) and self.current_batch_size > 0 else None
+
+            # Some Forge paths pass compact markers, e.g. [UNCOND, COND], while attention
+            # runs on expanded batch slots. Expand markers to per-slot resolution.
+            if batch_size is not None and len(markers) > 0 and len(markers) < batch_size and batch_size % len(markers) == 0:
+                repeat = batch_size // len(markers)
+                expanded = []
+                for marker in markers:
+                    expanded.extend([marker] * repeat)
+                markers = expanded
+
+            if batch_index >= len(markers):
+                return None
+            # Forge marks COND=0, UNCOND=1. Re-index only COND chunks to image batch order.
+            if markers[batch_index] != 0:
+                return None
+            cond_position = 0
+            for i, marker in enumerate(markers):
+                if marker == 0:
+                    if i == batch_index:
+                        return cond_position
+                    cond_position += 1
+            return None
+
+        # Legacy fallback: old A1111-style invocation alternates cond/uncond by call count.
+        batch_size = self.current_batch_size if isinstance(self.current_batch_size, int) and self.current_batch_size > 0 else None
+        if batch_size is not None and batch_size % 2 == 0:
+            cond_start = batch_size // 2
+            if batch_index >= cond_start:
+                return batch_index - cond_start
+            return None
+
+        if self.calledCount % 2 == 1:
+            return batch_index
+        return None
     
     ### forward implemetation of diffuser CrossAttention
     # def forward(self, hidden_states, context=None, mask=None):
@@ -324,7 +425,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
     #     hidden_states = self.to_out[1](hidden_states)
     #     return hidden_states
 
-    def _hooked_attention(hk_self, self, query, key, value, batch_size, sequence_length, dim, use_context: bool = True):
+    def _hooked_attention(hk_self, self, query, key, value, batch_size, sequence_length, dim, use_context: bool = True, n_tokens_to_mask: int = 0):
         """
         Monkey-patched version of :py:func:`.CrossAttention._attention` to capture attentions and aggregate them.
 
@@ -349,22 +450,24 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             return factor_b
         
         factor_base = calc_factor_base(hk_self.img_width, hk_self.img_height)
-                
+        scale = getattr(self, "scale", (self.dim_head ** -0.5))
         for batch_index in range(hidden_states.shape[0] // slice_size):
             start_idx = batch_index * slice_size
             end_idx = (batch_index + 1) * slice_size
             attn_slice = (
-                    torch.einsum("b i d, b j d -> b i j", query[start_idx:end_idx], key[start_idx:end_idx]) * self.scale
+                    torch.einsum("b i d, b j d -> b i j", query[start_idx:end_idx], key[start_idx:end_idx]) * scale
             )
-            factor = int(math.sqrt(factor_base // attn_slice.shape[1]))
             attn_slice = attn_slice.softmax(-1)
+            map_attn_slice = attn_slice[:, n_tokens_to_mask:, :] if n_tokens_to_mask > 0 else attn_slice
+            factor = int(math.sqrt(factor_base // max(map_attn_slice.shape[1], 1)))
             hid_states = torch.einsum("b i j, b j d -> b i d", attn_slice, value[start_idx:end_idx])            
-                
-            if use_context and  hk_self.calledCount % 2 == 1 and attn_slice.shape[-1] == hk_self.context_size:    
+
+            target_batch_index = hk_self._resolve_cond_batch_index(batch_index)
+
+            if use_context and target_batch_index is not None and map_attn_slice.shape[-1] == hk_self.context_size and map_attn_slice.shape[1] > 0:
                 if factor >= 1:
-                    factor //= 1
-                    maps = hk_self._up_sample_attn(attn_slice, value, factor)
-                    hk_self.heat_maps[batch_index][factor].append(maps)
+                    maps = hk_self._up_sample_attn(map_attn_slice, value[start_idx:end_idx], factor)
+                    hk_self.heat_maps[target_batch_index][factor].append(maps)
 
             hidden_states[start_idx:end_idx] = hid_states
 

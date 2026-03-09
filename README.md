@@ -1,46 +1,81 @@
-# DAAM Extension for Stable Diffusion Web UI
+# DAAM Extension for Stable Diffusion Web UI / Forge
 
-This is a port of [DAAM](https://github.com/castorini/daam) for Stable Diffusion Web UI.
+This extension is a WebUI script port of [DAAM](https://github.com/castorini/daam) with compatibility fixes for recent WebUI and Forge backends.
 
-*Now support for SDXL!*
+## Features
 
-# Update
-- `2024/01/28` Fixed an issue where it did not work with the latest version of webui. Added support for SDXL.
+- Attention heatmaps for comma-separated target phrases.
+- Explicit `Enable DAAM` toggle (on/off like other always-on scripts).
+- SDXL-compatible prompt token handling.
+- Forge-compatible UNet and text-encoder resolution.
+- Grid output mode for multiple attention terms.
 
-# Setup and Running
+## Install
 
-Clone this repository to extension folder.
+Clone into your WebUI/Forge extension directory:
 
-# How to use
+## Usage
 
-Select "Daam script" from the script drop-down. Enter the 'attention text' (must be a string contained in the prompt ) and run.
-An overlapping image with a heatmap for each attention will be generated along with the original image.
-Images will now be created in the default output directory.
+1. Open `txt2img` or `img2img`.
+2. Expand `Attention Heatmap`.
+3. Enable `Enable DAAM`.
+4. Enter target terms in `Attention texts for visualization` (comma separated).
+5. Generate.
 
-Attention text is divided by commas, but multiple words without commas are recognized as a single sequence.
-If you type "cat" for attention text, then all the tokens matching "cat" will be retrieved and combined into attention.
-If you type "cute cat", only tokens with "cute" and "cat" in sequence will be retrieved and only their attention will be output.
+The extension creates blended heatmap images and, if enabled, a `grid_daam-*.png` in the grid output directory.
 
-# Sample
+Notes:
 
-prompt : "A photo of a cute cat wearing sunglasses relaxing on a beach"
+- Multi-word phrases are matched as one sequence (for example `white dress`).
+- For reliable DAAM matching with LoRA, place LoRA at the very end of the positive prompt, after terms you want to visualize.
 
-attention text: "cat, sunglasses, beach"
+## Forge Notes
 
-output images: orginal, cat, sunglasses, beach
+### Hires Fix / Upscaling
+
+DAAM works with Hires Fix and non-latent upscalers (for example `4x-UltraSharp`).
+
+For API calls on some Forge builds, include:
+
+```json
+"hr_additional_modules": []
+```
+
+Without this field, Forge can raise:
+
+```text
+TypeError: argument of type 'NoneType' is not iterable
+```
+
+This error originates in Forge processing, not in DAAM logic itself.
+
+### ADetailer
+
+ADetailer performs an internal pre-pass `postprocess` callback before final image saving.  
+DAAM now defers final cleanup for that dummy callback so heatmaps remain available for the final output save stage.
+
+Current behavior:
+
+- DAAM heatmaps are generated for the main generation pass.
+- ADetailer can still change the final image composition after the main pass, so heatmaps should be interpreted as prompt attention guidance, not strict post-inpaint attribution.
+
+### Batch Size / Batch Count
+
+DAAM now supports Forge runs with both:
+
+- `batch_size > 1`
+- `n_iter (batch count) > 1`
+
+The extension no longer depends on `Batch pos` PNG metadata (which may be absent on Forge).  
+Instead, it resolves per-image batch positions from processing state and seed/filename fallback logic, and handles compact Forge `cond_or_uncond` layouts in attention tracing.
+
+## Sample
+
+- Prompt: `A photo of a cute cat wearing sunglasses relaxing on a beach`
+- Attention text: `cat, sunglasses, beach`
+- Output: original + one heatmap per attention term
 
 <img src="images/00006-2623256163.png" width="150">
 <img src="images/00006-2623256163_cat.png" width="150">
 <img src="images/00006-2623256163_sunglasses.png" width="150">
 <img src="images/00006-2623256163_beach.png" width="150">
-
-# Tutorial
-
-- [Easiest way to use DAAM script tutorial](https://www.youtube.com/watch?v=XiKyEKJrTLQ)
-
-[![image.png](https://s3.amazonaws.com/moonup/production/uploads/1675628788246-6345bd89fe134dfd7a0dba40.png)](https://www.youtube.com/watch?v=XiKyEKJrTLQ)
-
-# Notice
-At the moment, this works well with the Stable Diffusion 1.5 model.
-However, in the Stable Diffusion 2.0 model this seems to be working a little less well.
-
