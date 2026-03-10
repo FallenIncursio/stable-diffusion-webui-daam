@@ -44,10 +44,11 @@ def _resolve_diffusion_model(model):
 
 
 class UNetForwardHooker(ObjectHooker[UNetModel]):
-    def __init__(self, module: UNetModel, heat_maps: defaultdict(defaultdict)):
+    def __init__(self, module: UNetModel, heat_maps: defaultdict(defaultdict), runtime_state: Dict[str, Any] = None):
         super().__init__(module)
         self.all_heat_maps = []
         self.heat_maps = heat_maps
+        self.runtime_state = runtime_state if runtime_state is not None else {}
 
     def _hook_impl(self):
         self.monkey_patch('forward', self._forward)
@@ -56,6 +57,15 @@ class UNetForwardHooker(ObjectHooker[UNetModel]):
         pass
 
     def _forward(hk_self, self, *args, **kwargs):
+        transformer_options = kwargs.get("transformer_options", None)
+        if transformer_options is None and len(args) >= 6 and isinstance(args[5], dict):
+            transformer_options = args[5]
+
+        if isinstance(transformer_options, dict):
+            hk_self.runtime_state["cond_or_uncond"] = transformer_options.get("cond_or_uncond", None)
+        else:
+            hk_self.runtime_state["cond_or_uncond"] = None
+
         super_return = hk_self.monkey_super('forward', *args, **kwargs)
         hk_self.all_heat_maps.append(deepcopy(hk_self.heat_maps))
         hk_self.heat_maps.clear()
@@ -118,8 +128,9 @@ class DiffusionHeatMapHooker(AggregateHooker):
     def __init__(self, model: LatentDiffusion, heigth : int, width : int, context_size : int = 77, weighted: bool = False, layer_idx: int = None, head_idx: int = None):
         diffusion_model = _resolve_diffusion_model(model)
         heat_maps = defaultdict(lambda: defaultdict(list)) # batch index, factor, attention
-        modules = [UNetCrossAttentionHooker(x, heigth, width, heat_maps, context_size=context_size, weighted=weighted, head_idx=head_idx) for x in UNetCrossAttentionLocator().locate(diffusion_model, layer_idx)]
-        self.forward_hook = UNetForwardHooker(diffusion_model, heat_maps)
+        runtime_state = {"cond_or_uncond": None}
+        modules = [UNetCrossAttentionHooker(x, heigth, width, heat_maps, context_size=context_size, weighted=weighted, head_idx=head_idx, runtime_state=runtime_state) for x in UNetCrossAttentionLocator().locate(diffusion_model, layer_idx)]
+        self.forward_hook = UNetForwardHooker(diffusion_model, heat_maps, runtime_state=runtime_state)
         modules.append(self.forward_hook)
         
         self.height = heigth
@@ -211,7 +222,7 @@ class DiffusionHeatMapHooker(AggregateHooker):
 
 
 class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
-    def __init__(self, module: CrossAttention, img_height : int, img_width : int, heat_maps: defaultdict(defaultdict), context_size: int = 77, weighted: bool = False, head_idx: int = 0):
+    def __init__(self, module: CrossAttention, img_height : int, img_width : int, heat_maps: defaultdict(defaultdict), context_size: int = 77, weighted: bool = False, head_idx: int = 0, runtime_state: Dict[str, Any] = None):
         super().__init__(module)
         self.heat_maps = heat_maps
         self.context_size = context_size
@@ -222,12 +233,14 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         self.calledCount = 0
         self.cond_or_uncond = None
         self.current_batch_size = None
+        self.runtime_state = runtime_state if runtime_state is not None else {}
         
     def reset(self):
         self.heat_maps.clear()
         self.calledCount = 0
         self.cond_or_uncond = None
         self.current_batch_size = None
+        self.runtime_state["cond_or_uncond"] = None
 
     def _infer_spatial_hw(self, token_count: int):
         if token_count <= 0:
@@ -316,7 +329,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         if isinstance(transformer_options, dict):
             hk_self.cond_or_uncond = transformer_options.get("cond_or_uncond", None)
         else:
-            hk_self.cond_or_uncond = None
+            hk_self.cond_or_uncond = hk_self.runtime_state.get("cond_or_uncond", None)
 
         batch_size, sequence_length, _ = x.shape
         hk_self.current_batch_size = batch_size
@@ -464,9 +477,11 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
 
             target_batch_index = hk_self._resolve_cond_batch_index(batch_index)
 
-            if use_context and target_batch_index is not None and map_attn_slice.shape[-1] == hk_self.context_size and map_attn_slice.shape[1] > 0:
+            aligned_map_attn_slice = hk_self._align_context_tokens(map_attn_slice) if use_context and target_batch_index is not None else None
+
+            if use_context and target_batch_index is not None and aligned_map_attn_slice is not None and aligned_map_attn_slice.shape[1] > 0:
                 if factor >= 1:
-                    maps = hk_self._up_sample_attn(map_attn_slice, value[start_idx:end_idx], factor)
+                    maps = hk_self._up_sample_attn(aligned_map_attn_slice, value[start_idx:end_idx], factor)
                     hk_self.heat_maps[target_batch_index][factor].append(maps)
 
             hidden_states[start_idx:end_idx] = hid_states
@@ -474,6 +489,27 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         # reshape hidden_states
         hidden_states = hk_self.reshape_batch_dim_to_heads(self, hidden_states)
         return hidden_states
+
+    def _align_context_tokens(self, map_attn_slice: torch.Tensor):
+        target = self.context_size if isinstance(self.context_size, int) else 0
+        if target <= 0:
+            return map_attn_slice
+
+        context_tokens = map_attn_slice.shape[-1]
+        if context_tokens == target:
+            return map_attn_slice
+        if context_tokens < target:
+            return None
+
+        # ReForge can repeat cross-attn context to an LCM length before concat.
+        # Sum repeated groups back into the target token count.
+        if context_tokens % target == 0:
+            repeat = context_tokens // target
+            if repeat > 1:
+                new_shape = map_attn_slice.shape[:-1] + (repeat, target)
+                return map_attn_slice.reshape(new_shape).sum(-2)
+
+        return map_attn_slice[..., :target]
     
     def reshape_batch_dim_to_heads(hk_self, self, tensor):
         batch_size, seq_len, dim = tensor.shape

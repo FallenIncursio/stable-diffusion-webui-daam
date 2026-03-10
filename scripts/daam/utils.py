@@ -332,9 +332,36 @@ class PromptAnalyzer:
             chunks, token_count = self.clip.tokenize_line(line)
             return chunks, token_count
 
+        # ReForge/SDXL GeneralConditioner can expose prompt chunks via process_texts()
+        # even when tokenize_line() is not directly available on the wrapper.
+        if hasattr(self.clip, "process_texts"):
+            processed = self.clip.process_texts([line])
+            chunks, token_count = self._extract_chunks_from_process_texts(processed)
+            if chunks is not None:
+                return chunks, token_count
+
         tokens = self.encode(line)
         chunk = PromptAnalyzer._SimpleChunk(tokens)
         return [chunk], len(tokens)
+
+    @staticmethod
+    def _extract_chunks_from_process_texts(processed):
+        if not isinstance(processed, (list, tuple)) or len(processed) < 2:
+            return None, None
+
+        batch_chunks, token_count = processed[0], processed[1]
+
+        # Common webui path: process_texts([line]) -> ([[PromptChunk, ...]], token_count)
+        if isinstance(batch_chunks, (list, tuple)) and len(batch_chunks) > 0:
+            first = batch_chunks[0]
+            if isinstance(first, (list, tuple)) and len(first) > 0 and hasattr(first[0], "tokens"):
+                return list(first), token_count
+
+            # Fallback: process_texts(line) style -> [PromptChunk, ...]
+            if hasattr(first, "tokens"):
+                return list(batch_chunks), token_count
+
+        return None, None
 
     def process_text(self, texts):
         if hasattr(self.clip, "process_text"):
