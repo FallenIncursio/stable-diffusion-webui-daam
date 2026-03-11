@@ -69,6 +69,19 @@ DAAM now supports Forge runs with both:
 The extension no longer depends on `Batch pos` PNG metadata (which may be absent on Forge).  
 Instead, it resolves per-image batch positions from processing state and seed/filename fallback logic, and handles compact Forge `cond_or_uncond` layouts in attention tracing.
 
+### Output Folder Layout
+
+To avoid missing heatmaps, keep sample and grid output folders separate.
+
+Recommended:
+
+- `outdir_txt2img_samples = outputs/txt2img-images`
+- `outdir_img2img_samples = outputs/img2img-images`
+- `outdir_txt2img_grids = outputs/txt2img-grids`
+- `outdir_img2img_grids = outputs/img2img-grids`
+
+Avoid setting grid dirs to a parent folder that also contains sample dirs (for example `outdir_txt2img_grids = outputs` with samples in `outputs/*`), because this can cause grid/sample misclassification in legacy configs.
+
 ## Sample
 
 - Prompt: `A photo of a cute cat wearing sunglasses relaxing on a beach`

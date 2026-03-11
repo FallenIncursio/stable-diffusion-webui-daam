@@ -55,6 +55,7 @@ class Script(scripts.Script):
     GRID_LAYOUT_AUTO = "Auto"
     GRID_LAYOUT_PREVENT_EMPTY = "Prevent Empty Spot"
     GRID_LAYOUT_BATCH_LENGTH_AS_ROW = "Batch Length As Row"
+    _warned_output_overlap = False
     
 
     def title(self):
@@ -108,16 +109,32 @@ class Script(scripts.Script):
         basename = os.path.basename(filename).lower()
         if basename.startswith("grid-") or basename.startswith("grid_") or basename.startswith("griddaam") or basename.startswith("grid_daam"):
             return True
-
-        p = getattr(params, "p", None)
-        grid_dir = os.path.abspath(getattr(p, "outpath_grids", "") or "")
-        if filename and grid_dir:
-            try:
-                if os.path.commonpath([filename, grid_dir]) == grid_dir:
-                    return True
-            except ValueError:
-                return False
         return False
+
+    @classmethod
+    def _warn_if_output_dirs_overlap(cls, p):
+        if cls._warned_output_overlap:
+            return
+
+        samples_dir = os.path.abspath(getattr(p, "outpath_samples", "") or "")
+        grids_dir = os.path.abspath(getattr(p, "outpath_grids", "") or "")
+        if not samples_dir or not grids_dir:
+            return
+
+        try:
+            common = os.path.commonpath([samples_dir, grids_dir])
+        except ValueError:
+            return
+
+        # If grid output is a parent directory of sample output, directory-based
+        # grid heuristics can accidentally classify normal samples as grids.
+        if common == grids_dir and os.path.normcase(samples_dir) != os.path.normcase(grids_dir):
+            print(
+                "[DAAM] Warning: outpath_grids is a parent directory of outpath_samples. "
+                "Use separate grid folders (e.g. outputs/txt2img-grids, outputs/img2img-grids) "
+                "to avoid missing heatmaps in legacy configs."
+            )
+            cls._warned_output_overlap = True
 
     def _index_in_seed_list(self, seed_list, seed):
         if not isinstance(seed_list, (list, tuple)):
@@ -243,6 +260,8 @@ class Script(scripts.Script):
             global before_image_saved_handler
             before_image_saved_handler = None
             return
+
+        Script._warn_if_output_dirs_overlap(p)
 
         fix_seed(p)
         
