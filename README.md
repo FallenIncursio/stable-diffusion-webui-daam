@@ -10,6 +10,11 @@ This extension is a WebUI script port of [DAAM](https://github.com/castorini/daa
   - Variant blocks like `{red eyes|blue eyes}` / `[red eyes|blue eyes]`
   - Wildcard tokens like `__eye_color__` (resolved against wildcard files)
 - Explicit `Enable DAAM` toggle (on/off like other always-on scripts).
+- Time-focus controls with explicit on/off:
+  - `Enable time focus`
+  - modes: `Disabled` (default), `All`, `Early`, `Mid`, `Late`, `Triplet`
+- `Triplet` mode renders `Early + Mid + Late` in one run.
+- Optional diagnostics JSON (`*_daam_diag.json`) with per-term match status and reason codes.
 - SDXL-compatible prompt token handling.
 - Forge-compatible UNet and text-encoder resolution.
 - Grid output mode for multiple attention terms.
@@ -35,6 +40,9 @@ Notes:
 - For Dynamic Prompts, DAAM matches against the resolved per-image prompt text.
 - DAAM normalizes extra-network tags (for example LoRA) for internal token mapping, so LoRA position (start/middle/end) should not change heatmap term matching.
 - For API generation, set `"save_images": true` so save hooks run and DAAM heatmaps are produced.
+- `All` means one aggregated heatmap over all denoising steps.
+- `Triplet` means three phase heatmaps (`Early`, `Mid`, `Late`) in one generation.
+- For `Triplet`, using `Use grid (output to grid dir)` is recommended for easier comparison.
 
 ## Forge Notes
 
@@ -75,6 +83,7 @@ DAAM now supports Forge runs with both:
 
 The extension no longer depends on `Batch pos` PNG metadata (which may be absent on Forge).  
 Instead, it resolves per-image batch positions from processing state and seed/filename fallback logic, and handles compact Forge `cond_or_uncond` layouts in attention tracing.
+It also keeps per-batch prompt analyzers so variable prompts in one batch resolve terms correctly.
 
 ### Output Folder Layout
 

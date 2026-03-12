@@ -1,5 +1,6 @@
 from __future__ import annotations
 import glob
+import json
 import os
 import re
 
@@ -55,6 +56,12 @@ class Script(scripts.Script):
     GRID_LAYOUT_AUTO = "Auto"
     GRID_LAYOUT_PREVENT_EMPTY = "Prevent Empty Spot"
     GRID_LAYOUT_BATCH_LENGTH_AS_ROW = "Batch Length As Row"
+    TIME_FOCUS_DISABLED = "Disabled"
+    TIME_FOCUS_ALL = "All"
+    TIME_FOCUS_EARLY = "Early"
+    TIME_FOCUS_MID = "Mid"
+    TIME_FOCUS_LATE = "Late"
+    TIME_FOCUS_TRIPLET = "Triplet"
     _warned_output_overlap = False
     _invalid_filename_chars = re.compile(r'[<>:"/\\|?*\x00-\x1F]+')
     _break_regex = re.compile(r"\bBREAK\b", flags=re.IGNORECASE)
@@ -255,12 +262,230 @@ class Script(scripts.Script):
         return text or "attention"
 
     @classmethod
+    def _normalize_time_focus(cls, value):
+        if not isinstance(value, str):
+            return cls.TIME_FOCUS_ALL
+        normalized = value.strip().lower()
+        if normalized == "disabled":
+            return cls.TIME_FOCUS_ALL
+        if normalized == "early":
+            return cls.TIME_FOCUS_EARLY
+        if normalized == "mid":
+            return cls.TIME_FOCUS_MID
+        if normalized == "late":
+            return cls.TIME_FOCUS_LATE
+        if normalized == "triplet":
+            return cls.TIME_FOCUS_TRIPLET
+        return cls.TIME_FOCUS_ALL
+
+    def _parse_optional_daam_flags(self, enable_daam, extra_args, **kwargs):
+        """
+        Parse optional Sprint-A flags while keeping old API payloads valid.
+
+        Supported positional forms:
+        - [enable_daam]
+        - [enable_daam, time_focus, enable_diagnostics]
+        - [time_focus, enable_diagnostics, enable_daam] (legacy sprint test payload)
+        """
+        parsed_enable = bool(enable_daam)
+        parsed_focus = self.TIME_FOCUS_ALL
+        parsed_diagnostics = False
+        parsed_enable_time_focus = None
+        focus_explicit = False
+
+        args = list(extra_args or [])
+
+        # Compatibility for payload order where focus was inserted before enable.
+        if isinstance(enable_daam, str):
+            parsed_focus = enable_daam
+            focus_explicit = True
+            if len(args) >= 1 and isinstance(args[0], bool):
+                parsed_diagnostics = args[0]
+                args = args[1:]
+            if len(args) >= 1 and isinstance(args[0], bool):
+                parsed_enable = args[0]
+                args = args[1:]
+
+        # Preferred new order: [enable_time_focus, time_focus, enable_diagnostics]
+        if len(args) >= 3 and isinstance(args[0], bool) and isinstance(args[1], str) and isinstance(args[2], bool):
+            parsed_enable_time_focus = args[0]
+            parsed_focus = args[1]
+            focus_explicit = True
+            parsed_diagnostics = args[2]
+            args = args[3:]
+
+        # Legacy order from earlier tests: [time_focus, diagnostics, enable]
+        elif len(args) >= 3 and isinstance(args[0], str) and isinstance(args[1], bool) and isinstance(args[2], bool):
+            parsed_focus = args[0]
+            focus_explicit = True
+            parsed_diagnostics = args[1]
+            parsed_enable = args[2]
+            args = args[3:]
+        else:
+            # Legacy order: [time_focus?, diagnostics?] after explicit enable_daam arg.
+            if len(args) >= 1 and isinstance(args[0], str):
+                parsed_focus = args[0]
+                focus_explicit = True
+                args = args[1:]
+            if len(args) >= 1 and isinstance(args[0], bool):
+                parsed_diagnostics = args[0]
+                args = args[1:]
+
+        if "enable_daam" in kwargs:
+            parsed_enable = bool(kwargs.get("enable_daam"))
+        if "time_focus" in kwargs:
+            parsed_focus = kwargs.get("time_focus")
+            focus_explicit = True
+        if "enable_time_focus" in kwargs:
+            parsed_enable_time_focus = bool(kwargs.get("enable_time_focus"))
+        if "enable_diagnostics" in kwargs:
+            parsed_diagnostics = bool(kwargs.get("enable_diagnostics"))
+
+        if parsed_enable_time_focus is None:
+            # Backward compatibility:
+            # if a focus was explicitly provided in older payloads, keep it active.
+            parsed_enable_time_focus = focus_explicit
+        if not parsed_enable_time_focus:
+            parsed_focus = self.TIME_FOCUS_ALL
+
+        return (
+            bool(parsed_enable),
+            bool(parsed_enable_time_focus),
+            self._normalize_time_focus(parsed_focus),
+            bool(parsed_diagnostics),
+            args,
+        )
+
+    def _resolve_batch_prompts(self, prompts, extra_args, kwargs):
+        if prompts is None:
+            prompts = kwargs.get("prompts", None)
+
+        if prompts is not None:
+            return prompts
+
+        # Some call paths pass prompts positionally after script args.
+        for candidate in extra_args:
+            if isinstance(candidate, (list, tuple)):
+                if len(candidate) == 0:
+                    prompts = candidate
+                    break
+                if isinstance(candidate[0], str):
+                    prompts = candidate
+                    break
+
+        # Fallback: first list/tuple candidate even if not string-typed (legacy edge case).
+        if prompts is None:
+            for candidate in extra_args:
+                if isinstance(candidate, (list, tuple)):
+                    prompts = candidate
+                    break
+
+        if prompts is None:
+            for candidate in extra_args:
+                if isinstance(candidate, str):
+                    prompts = [candidate]
+                    break
+
+        return prompts
+
+    def _get_prompt_analyzer_for_batch(self, batch_pos: int, prompt_text: str):
+        analyzers = getattr(self, "prompt_analyzers", None)
+        if isinstance(analyzers, list) and len(analyzers) > 0:
+            if 0 <= batch_pos < len(analyzers):
+                return analyzers[batch_pos]
+            return analyzers[0]
+
+        analyzer = getattr(self, "prompt_analyzer", None)
+        if analyzer is not None:
+            return analyzer
+
+        text_engine = getattr(self, "text_engine", None)
+        if text_engine is None or not prompt_text:
+            return None
+        return utils.PromptAnalyzer(text_engine, prompt_text)
+
+    def _resolve_focus_kwargs(self, tracer, focus_override=None):
+        time_focus = self._normalize_time_focus(
+            focus_override if focus_override is not None else getattr(self, "time_focus", self.TIME_FOCUS_ALL)
+        )
+        if time_focus == self.TIME_FOCUS_ALL:
+            return {}
+
+        all_heat_maps = getattr(tracer, "all_heat_maps", None) or []
+        total_steps = len(all_heat_maps)
+        if total_steps <= 0:
+            return {}
+
+        third = max(1, total_steps // 3)
+        if time_focus == self.TIME_FOCUS_EARLY:
+            return {"first_n": third}
+        if time_focus == self.TIME_FOCUS_MID:
+            return {"time_idx": max(0, min(total_steps - 1, total_steps // 2))}
+        if time_focus == self.TIME_FOCUS_LATE:
+            return {"last_n": third}
+        return {}
+
+    def _resolve_focus_targets(self, tracer):
+        enable_time_focus = bool(getattr(self, "enable_time_focus", False))
+        if not enable_time_focus:
+            return [(self.TIME_FOCUS_ALL, {})]
+
+        focus_mode = self._normalize_time_focus(getattr(self, "time_focus", self.TIME_FOCUS_ALL))
+        if focus_mode == self.TIME_FOCUS_TRIPLET:
+            return [
+                (self.TIME_FOCUS_EARLY, self._resolve_focus_kwargs(tracer, self.TIME_FOCUS_EARLY)),
+                (self.TIME_FOCUS_MID, self._resolve_focus_kwargs(tracer, self.TIME_FOCUS_MID)),
+                (self.TIME_FOCUS_LATE, self._resolve_focus_kwargs(tracer, self.TIME_FOCUS_LATE)),
+            ]
+
+        return [(focus_mode, self._resolve_focus_kwargs(tracer, focus_mode))]
+
+    def _diagnose_missing_heatmap(self, raw_attention: str, resolved_attention: str, candidates, prompt_text: str, prompt_analyzer):
+        if len(candidates) == 0:
+            return "no_candidates"
+
+        if not any(self._contains_phrase(prompt_text, candidate) for candidate in candidates):
+            return "term_not_in_resolved_prompt"
+
+        used_custom_terms = getattr(prompt_analyzer, "used_custom_terms", []) if prompt_analyzer is not None else []
+        attention_keys = {self._normalize_for_match(raw_attention), self._normalize_for_match(resolved_attention)}
+        for item in used_custom_terms:
+            if not isinstance(item, (list, tuple)) or len(item) == 0:
+                continue
+            key = self._normalize_for_match(str(item[0]))
+            if key in attention_keys:
+                return "embedding_or_custom_term"
+
+        if prompt_analyzer is not None:
+            token_count = int(getattr(prompt_analyzer, "token_count", 0) or 0)
+            context_size = int(getattr(prompt_analyzer, "context_size", 0) or 0)
+            if context_size > 0 and token_count >= max(1, context_size - 2):
+                return "possible_context_truncation"
+
+        return "token_not_found_in_attention_map"
+
+    def _save_diagnostics(self, params, payload):
+        if not payload:
+            return
+        fullfn_without_extension, _ = os.path.splitext(params.filename)
+        diagnostics_path = fullfn_without_extension + "_daam_diag.json"
+        try:
+            with open(diagnostics_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[DAAM] Failed to save diagnostics at {diagnostics_path}: {e}")
+
+    @classmethod
     def _canonicalize_prompt_for_daam(cls, prompt: str):
         """
         Normalize extra-network tag placement for token alignment.
         Forge can expose slightly different chunking when tags (for example LoRA)
         are placed at the start of the prompt, which can destabilize DAAM mapping.
         """
+        if prompt is None:
+            return ""
+        if not isinstance(prompt, str):
+            return ""
         prompt = (prompt or "").strip()
         if not prompt:
             return prompt
@@ -443,13 +668,32 @@ class Script(scripts.Script):
                     trace_each_layers = gr.Checkbox(label = 'Trace each layers', value=False)
 
                     layers_as_row = gr.Checkbox(label = 'Use layers as row instead of Batch Length', value=False)
+
+                with gr.Row():
+                    enable_time_focus = gr.Checkbox(label='Enable time focus', value=False)
+
+                    time_focus = gr.Dropdown(
+                        [
+                            Script.TIME_FOCUS_DISABLED,
+                            Script.TIME_FOCUS_ALL,
+                            Script.TIME_FOCUS_EARLY,
+                            Script.TIME_FOCUS_MID,
+                            Script.TIME_FOCUS_LATE,
+                            Script.TIME_FOCUS_TRIPLET,
+                        ],
+                        label="Time focus",
+                        value=Script.TIME_FOCUS_DISABLED,
+                    )
+
+                with gr.Row():
+                    enable_diagnostics = gr.Checkbox(label='Enable diagnostics', value=False)
         
         
         self.tracers = None
         self.run_active = False
         
-        # Keep toggle as the last arg for API backward compatibility.
-        return [attention_texts, hide_images, dont_save_images, hide_caption, use_grid, grid_layouyt, alpha, heatmap_image_scale, trace_each_layers, layers_as_row, enable_daam] 
+        # Keep enable toggle at index 10 for API backward compatibility.
+        return [attention_texts, hide_images, dont_save_images, hide_caption, use_grid, grid_layouyt, alpha, heatmap_image_scale, trace_each_layers, layers_as_row, enable_daam, enable_time_focus, time_focus, enable_diagnostics] 
     
     def process(self, 
             p : StableDiffusionProcessing, 
@@ -463,7 +707,12 @@ class Script(scripts.Script):
             heatmap_image_scale : float,
             trace_each_layers : bool,
             layers_as_row: bool,
-            enable_daam: bool = True):
+            enable_daam: bool = True,
+            *extra_args,
+            **kwargs):
+        enable_daam, enable_time_focus, time_focus, enable_diagnostics, _ = self._parse_optional_daam_flags(
+            enable_daam, extra_args, **kwargs
+        )
         attentions = self._split_attention_texts(attention_texts)
 
         # ADetailer can trigger nested script.process() calls during a running txt2img pass.
@@ -485,6 +734,11 @@ class Script(scripts.Script):
         self.heatmap_images = dict()
         self.deferred_cleanup = False
         self.saved_sample_count = 0
+        self.enable_time_focus = enable_time_focus
+        self.time_focus = time_focus
+        self.enable_diagnostics = enable_diagnostics
+        self.prompt_analyzers = []
+        self.text_engine = None
 
         self.attentions = attentions
         self.enabled = bool(enable_daam) and len(self.attentions) > 0
@@ -513,21 +767,18 @@ class Script(scripts.Script):
             heatmap_image_scale : float,
             trace_each_layers : bool,
             layers_as_row: bool,
+            enable_daam: bool = True,
             *extra_args,
             prompts=None,
             **kwargs):
-        enable_daam = True
-        if len(extra_args) > 0 and isinstance(extra_args[0], bool):
-            enable_daam = extra_args[0]
+        enable_daam, enable_time_focus, time_focus, enable_diagnostics, remaining_args = self._parse_optional_daam_flags(
+            enable_daam, extra_args, **kwargs
+        )
+        prompts = self._resolve_batch_prompts(prompts, remaining_args, kwargs)
 
-        if prompts is None:
-            # Some call paths pass prompts positionally after script args.
-            if len(extra_args) > 0 and not isinstance(extra_args[0], bool):
-                prompts = extra_args[0]
-            elif len(extra_args) > 1 and isinstance(extra_args[0], bool):
-                prompts = extra_args[1]
-            else:
-                prompts = kwargs.get("prompts", None)
+        self.enable_time_focus = enable_time_focus
+        self.time_focus = time_focus
+        self.enable_diagnostics = enable_diagnostics
 
         if not enable_daam:
             return
@@ -546,21 +797,40 @@ class Script(scripts.Script):
         elif isinstance(prompts, tuple):
             prompts = tuple(self._canonicalize_prompt_for_daam(prompt) for prompt in prompts)
 
-        styled_prompt = prompts[0]
+        prompts_list = list(prompts) if isinstance(prompts, (list, tuple)) else [prompts]
+        if len(prompts_list) == 0:
+            return
 
         text_engine = _resolve_text_engine(p.sd_model)
         assert text_engine is not None, f"DAAM does not support this text encoder: {type(getattr(p.sd_model, 'cond_stage_model', None))}"
+        self.text_engine = text_engine
 
-        prompt_analyzer = utils.PromptAnalyzer(text_engine, styled_prompt)
-        self.prompt_analyzer = prompt_analyzer
-        context_size = prompt_analyzer.context_size
+        self.prompt_analyzers = []
+        context_size = 77
+        for prompt_text in prompts_list:
+            if not isinstance(prompt_text, str):
+                continue
+            if not prompt_text.strip():
+                continue
+            prompt_analyzer = utils.PromptAnalyzer(text_engine, prompt_text)
+            self.prompt_analyzers.append(prompt_analyzer)
+            context_size = max(context_size, int(getattr(prompt_analyzer, "context_size", 77) or 77))
+        if len(self.prompt_analyzers) == 0:
+            return
+
+        self.prompt_analyzer = self.prompt_analyzers[0]
 
         diffusion_model = _resolve_diffusion_model(p.sd_model)
                 
-        print(f"daam run with context_size={prompt_analyzer.context_size}, token_count={prompt_analyzer.token_count}")
-        print(f"remade_tokens={prompt_analyzer.tokens}, multipliers={prompt_analyzer.multipliers}")
-        print(f"hijack_comments={prompt_analyzer.hijack_comments}, used_custom_terms={prompt_analyzer.used_custom_terms}")
-        print(f"fixes={prompt_analyzer.fixes}")
+        first_analyzer = self.prompt_analyzer
+        print(
+            f"daam run with context_size={context_size}, token_count={first_analyzer.token_count}, "
+            f"time_focus_enabled={self.enable_time_focus}, time_focus={self.time_focus}, "
+            f"diagnostics={self.enable_diagnostics}, batch_prompts={len(prompts_list)}"
+        )
+        print(f"remade_tokens={first_analyzer.tokens}, multipliers={first_analyzer.multipliers}")
+        print(f"hijack_comments={first_analyzer.hijack_comments}, used_custom_terms={first_analyzer.used_custom_terms}")
+        print(f"fixes={first_analyzer.fixes}")
         
         if any(isinstance(item, (list, tuple)) and len(item) > 0 and item[0] in self.attentions for item in self.prompt_analyzer.used_custom_terms):
             print("Embedding heatmap cannot be shown.")
@@ -597,7 +867,11 @@ class Script(scripts.Script):
             trace_each_layers : bool,
             layers_as_row: bool,
             enable_daam: bool = True,
+            *extra_args,
             **kwargs):
+        _, self.enable_time_focus, self.time_focus, self.enable_diagnostics, _ = self._parse_optional_daam_flags(
+            enable_daam, extra_args, **kwargs
+        )
         if self.enabled == False:
             return
 
@@ -683,51 +957,119 @@ class Script(scripts.Script):
             return
         
         if self.tracers is not None and len(self.attentions) > 0:
+            diagnostics_entries = []
             for i, tracer in enumerate(self.tracers):
                 with torch.no_grad():
                     effective_prompt = self._resolve_effective_prompt(params, batch_pos)
                     styled_prompt = self._canonicalize_prompt_for_daam(effective_prompt)
-                    try:
-                        global_heat_map = tracer.compute_global_heat_map(self.prompt_analyzer, styled_prompt, batch_pos)              
-                    except Exception:
+                    prompt_analyzer = self._get_prompt_analyzer_for_batch(batch_pos, styled_prompt)
+                    if prompt_analyzer is None:
                         continue
-                    
                     if i not in self.heatmap_images:
                         self.heatmap_images[i] = []
-                    
-                    if global_heat_map is not None:
-                        heatmap_images = []
+
+                    heatmap_images = []
+                    for focus_label, focus_kwargs in self._resolve_focus_targets(tracer):
+                        try:
+                            global_heat_map = tracer.compute_global_heat_map(
+                                prompt_analyzer, styled_prompt, batch_pos, **focus_kwargs
+                            )
+                        except Exception:
+                            continue
+
+                        if global_heat_map is None:
+                            continue
+
                         for raw_attention in self.attentions:
                             attention = self._resolve_attention_term(raw_attention, styled_prompt)
                             attn_candidates = self._attention_candidates(raw_attention, attention)
-                                     
+
                             img_size = params.image.size
                             attn_caption = self.attn_captions[i] if i < len(self.attn_captions) else ""
-                            caption = attention + (" " + attn_caption if attn_caption else "") if not self.hide_caption else None
-                            
+                            focus_caption = focus_label if getattr(self, "enable_time_focus", False) else ""
+                            caption = (
+                                attention
+                                + (" " + attn_caption if attn_caption else "")
+                                + (f" [{focus_caption}]" if focus_caption else "")
+                                if not self.hide_caption
+                                else None
+                            )
+
                             heat_map = None
+                            matched_candidate = None
                             for candidate in attn_candidates:
                                 heat_map = global_heat_map.compute_word_heat_map(candidate)
                                 if heat_map is not None:
+                                    matched_candidate = candidate
                                     break
-                            if heat_map is None : print(f"No heatmaps for '{raw_attention}' (resolved='{attention}')")
-                             
-                            heat_map_img = utils.expand_image(heat_map, img_size[1], img_size[0]) if heat_map is not None else None
-                            img : Image.Image = utils.image_overlay_heat_map(params.image, heat_map_img, alpha=self.alpha, caption=caption, image_scale=self.heatmap_image_scale)
+                            reason = "ok"
+                            if heat_map is None:
+                                reason = self._diagnose_missing_heatmap(
+                                    raw_attention, attention, attn_candidates, styled_prompt, prompt_analyzer
+                                )
+                                print(
+                                    f"No heatmaps for '{raw_attention}' "
+                                    f"(resolved='{attention}', focus={focus_label}, reason={reason})"
+                                )
+                            if self.enable_diagnostics:
+                                diagnostics_entries.append(
+                                    {
+                                        "layer": attn_caption or "ALL",
+                                        "focus": focus_label,
+                                        "raw_attention": raw_attention,
+                                        "resolved_attention": attention,
+                                        "candidates": attn_candidates,
+                                        "matched": heat_map is not None,
+                                        "matched_candidate": matched_candidate,
+                                        "reason": reason,
+                                    }
+                                )
 
-                            fullfn_without_extension, extension = os.path.splitext(params.filename) 
+                            heat_map_img = (
+                                utils.expand_image(heat_map, img_size[1], img_size[0]) if heat_map is not None else None
+                            )
+                            img: Image.Image = utils.image_overlay_heat_map(
+                                params.image,
+                                heat_map_img,
+                                alpha=self.alpha,
+                                caption=caption,
+                                image_scale=self.heatmap_image_scale,
+                            )
+
+                            fullfn_without_extension, extension = os.path.splitext(params.filename)
                             filename_attention = self._sanitize_filename_fragment(attention)
                             filename_caption = self._sanitize_filename_fragment(attn_caption) if attn_caption else ""
-                            full_filename = fullfn_without_extension + "_" + filename_attention +  ("_" + filename_caption if filename_caption else "") + extension
-                            
+                            filename_focus = self._sanitize_filename_fragment(focus_caption) if focus_caption else ""
+                            full_filename = (
+                                fullfn_without_extension
+                                + "_"
+                                + filename_attention
+                                + ("_" + filename_focus if filename_focus else "")
+                                + ("_" + filename_caption if filename_caption else "")
+                                + extension
+                            )
+
                             if self.use_grid:
                                 heatmap_images.append(img)
                             else:
                                 heatmap_images.append(img)
-                                if not self.dont_save_images:               
-                                    img.save(full_filename)                            
-                        
+                                if not self.dont_save_images:
+                                    img.save(full_filename)
+
+                    if len(heatmap_images) > 0:
                         self.heatmap_images[i] += heatmap_images
+
+            if self.enable_diagnostics and len(diagnostics_entries) > 0:
+                diagnostics_payload = {
+                    "filename": params.filename,
+                    "seed": self._extract_seed_from_filename(getattr(params, "filename", "")),
+                    "batch_pos": batch_pos,
+                    "enable_time_focus": self.enable_time_focus,
+                    "time_focus": self.time_focus,
+                    "prompt": styled_prompt,
+                    "entries": diagnostics_entries,
+                }
+                self._save_diagnostics(params, diagnostics_payload)
         
         self.heatmap_images = {j:self.heatmap_images[j] for j in self.heatmap_images.keys() if self.heatmap_images[j]}
 
