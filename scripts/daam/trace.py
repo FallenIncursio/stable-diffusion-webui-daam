@@ -44,10 +44,19 @@ def _resolve_diffusion_model(model):
 
 
 class UNetForwardHooker(ObjectHooker[UNetModel]):
-    def __init__(self, module: UNetModel, heat_maps: defaultdict(defaultdict), runtime_state: Dict[str, Any] = None):
+    def __init__(
+        self,
+        module: UNetModel,
+        heat_maps_cond: defaultdict(defaultdict),
+        heat_maps_uncond: defaultdict(defaultdict),
+        runtime_state: Dict[str, Any] = None,
+    ):
         super().__init__(module)
-        self.all_heat_maps = []
-        self.heat_maps = heat_maps
+        self.all_heat_maps_cond = []
+        self.all_heat_maps_uncond = []
+        self.all_heat_maps = self.all_heat_maps_cond  # backward-compatible alias
+        self.heat_maps_cond = heat_maps_cond
+        self.heat_maps_uncond = heat_maps_uncond
         self.runtime_state = runtime_state if runtime_state is not None else {}
 
     def _hook_impl(self):
@@ -67,8 +76,10 @@ class UNetForwardHooker(ObjectHooker[UNetModel]):
             hk_self.runtime_state["cond_or_uncond"] = None
 
         super_return = hk_self.monkey_super('forward', *args, **kwargs)
-        hk_self.all_heat_maps.append(deepcopy(hk_self.heat_maps))
-        hk_self.heat_maps.clear()
+        hk_self.all_heat_maps_cond.append(deepcopy(hk_self.heat_maps_cond))
+        hk_self.all_heat_maps_uncond.append(deepcopy(hk_self.heat_maps_uncond))
+        hk_self.heat_maps_cond.clear()
+        hk_self.heat_maps_uncond.clear()
 
         return super_return
 
@@ -127,10 +138,24 @@ class MmDetectHeatMap:
 class DiffusionHeatMapHooker(AggregateHooker):
     def __init__(self, model: LatentDiffusion, heigth : int, width : int, context_size : int = 77, weighted: bool = False, layer_idx: int = None, head_idx: int = None):
         diffusion_model = _resolve_diffusion_model(model)
-        heat_maps = defaultdict(lambda: defaultdict(list)) # batch index, factor, attention
+        heat_maps_cond = defaultdict(lambda: defaultdict(list)) # batch index, factor, attention
+        heat_maps_uncond = defaultdict(lambda: defaultdict(list)) # batch index, factor, attention
         runtime_state = {"cond_or_uncond": None}
-        modules = [UNetCrossAttentionHooker(x, heigth, width, heat_maps, context_size=context_size, weighted=weighted, head_idx=head_idx, runtime_state=runtime_state) for x in UNetCrossAttentionLocator().locate(diffusion_model, layer_idx)]
-        self.forward_hook = UNetForwardHooker(diffusion_model, heat_maps, runtime_state=runtime_state)
+        modules = [
+            UNetCrossAttentionHooker(
+                x,
+                heigth,
+                width,
+                heat_maps_cond,
+                heat_maps_uncond,
+                context_size=context_size,
+                weighted=weighted,
+                head_idx=head_idx,
+                runtime_state=runtime_state,
+            )
+            for x in UNetCrossAttentionLocator().locate(diffusion_model, layer_idx)
+        ]
+        self.forward_hook = UNetForwardHooker(diffusion_model, heat_maps_cond, heat_maps_uncond, runtime_state=runtime_state)
         modules.append(self.forward_hook)
         
         self.height = heigth
@@ -144,16 +169,36 @@ class DiffusionHeatMapHooker(AggregateHooker):
 
     @property
     def all_heat_maps(self):
-        return self.forward_hook.all_heat_maps
+        return self.forward_hook.all_heat_maps_cond
+
+    @property
+    def all_heat_maps_positive(self):
+        return self.forward_hook.all_heat_maps_cond
+
+    @property
+    def all_heat_maps_negative(self):
+        return self.forward_hook.all_heat_maps_uncond
     
     def reset(self):
         for module in self.module:
             if hasattr(module, "reset"):
                 module.reset()
-        self.forward_hook.all_heat_maps.clear()
+        self.forward_hook.all_heat_maps_cond.clear()
+        self.forward_hook.all_heat_maps_uncond.clear()
         return
 
-    def compute_global_heat_map(self, prompt_analyzer, prompt, batch_index, time_weights=None, time_idx=None, last_n=None, first_n=None, factors=None):
+    def compute_global_heat_map(
+        self,
+        prompt_analyzer,
+        prompt,
+        batch_index,
+        time_weights=None,
+        time_idx=None,
+        last_n=None,
+        first_n=None,
+        factors=None,
+        guidance_mode: str = "cond",
+    ):
         # type: (PromptAnalyzer, str, int, int, int, int, int, List[float]) -> HeatMap
         """
         Compute the global heat map for the given prompt, aggregating across time (inference steps) and space (different
@@ -170,16 +215,19 @@ class DiffusionHeatMapHooker(AggregateHooker):
                 Mutually exclusive with `time_idx`.
             factors: Restrict the application to heat maps with spatial factors in this set. If `None`, use all sizes.
         """
-        if len(self.forward_hook.all_heat_maps) == 0:
+        if guidance_mode == "uncond":
+            all_heat_maps = self.forward_hook.all_heat_maps_uncond
+        else:
+            all_heat_maps = self.forward_hook.all_heat_maps_cond
+
+        if len(all_heat_maps) == 0:
             return None
         
         if time_weights is None:
-            time_weights = [1.0] * len(self.forward_hook.all_heat_maps)
+            time_weights = [1.0] * len(all_heat_maps)
 
         time_weights = np.array(time_weights)
         time_weights /= time_weights.sum()
-        all_heat_maps = self.forward_hook.all_heat_maps
-
         if time_idx is not None:
             heat_maps = [all_heat_maps[time_idx]]
         else:
@@ -222,9 +270,21 @@ class DiffusionHeatMapHooker(AggregateHooker):
 
 
 class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
-    def __init__(self, module: CrossAttention, img_height : int, img_width : int, heat_maps: defaultdict(defaultdict), context_size: int = 77, weighted: bool = False, head_idx: int = 0, runtime_state: Dict[str, Any] = None):
+    def __init__(
+        self,
+        module: CrossAttention,
+        img_height : int,
+        img_width : int,
+        heat_maps_cond: defaultdict(defaultdict),
+        heat_maps_uncond: defaultdict(defaultdict),
+        context_size: int = 77,
+        weighted: bool = False,
+        head_idx: int = 0,
+        runtime_state: Dict[str, Any] = None,
+    ):
         super().__init__(module)
-        self.heat_maps = heat_maps
+        self.heat_maps = heat_maps_cond
+        self.heat_maps_uncond = heat_maps_uncond
         self.context_size = context_size
         self.weighted = weighted
         self.head_idx = head_idx
@@ -237,6 +297,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         
     def reset(self):
         self.heat_maps.clear()
+        self.heat_maps_uncond.clear()
         self.calledCount = 0
         self.cond_or_uncond = None
         self.current_batch_size = None
@@ -364,7 +425,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         
         return self.to_out(out)
 
-    def _resolve_cond_batch_index(self, batch_index: int):
+    def _resolve_guidance_batch_index(self, batch_index: int):
         cond_or_uncond = self.cond_or_uncond
         if isinstance(cond_or_uncond, (list, tuple)):
             markers = list(cond_or_uncond)
@@ -380,29 +441,34 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
                 markers = expanded
 
             if batch_index >= len(markers):
-                return None
-            # Forge marks COND=0, UNCOND=1. Re-index only COND chunks to image batch order.
-            if markers[batch_index] != 0:
-                return None
-            cond_position = 0
-            for i, marker in enumerate(markers):
-                if marker == 0:
-                    if i == batch_index:
-                        return cond_position
-                    cond_position += 1
-            return None
+                return None, None
+            marker_at_index = markers[batch_index]
+            if marker_at_index not in (0, 1):
+                return None, None
 
-        # Legacy fallback: old A1111-style invocation alternates cond/uncond by call count.
+            # Forge marks COND=0, UNCOND=1.
+            match_marker = marker_at_index
+            guidance = "cond" if match_marker == 0 else "uncond"
+            guidance_position = 0
+            for i, marker in enumerate(markers):
+                if marker == match_marker:
+                    if i == batch_index:
+                        return guidance, guidance_position
+                    guidance_position += 1
+            return None, None
+
+        # Legacy fallback: old A1111-style invocation commonly packs [uncond, cond].
         batch_size = self.current_batch_size if isinstance(self.current_batch_size, int) and self.current_batch_size > 0 else None
         if batch_size is not None and batch_size % 2 == 0:
             cond_start = batch_size // 2
             if batch_index >= cond_start:
-                return batch_index - cond_start
-            return None
+                return "cond", batch_index - cond_start
+            return "uncond", batch_index
 
+        # Last resort fallback: odd call=cond, even call=uncond.
         if self.calledCount % 2 == 1:
-            return batch_index
-        return None
+            return "cond", batch_index
+        return "uncond", batch_index
     
     ### forward implemetation of diffuser CrossAttention
     # def forward(self, hidden_states, context=None, mask=None):
@@ -475,14 +541,21 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
             factor = int(math.sqrt(factor_base // max(map_attn_slice.shape[1], 1)))
             hid_states = torch.einsum("b i j, b j d -> b i d", attn_slice, value[start_idx:end_idx])            
 
-            target_batch_index = hk_self._resolve_cond_batch_index(batch_index)
+            guidance_mode, target_batch_index = hk_self._resolve_guidance_batch_index(batch_index)
 
-            aligned_map_attn_slice = hk_self._align_context_tokens(map_attn_slice) if use_context and target_batch_index is not None else None
+            aligned_map_attn_slice = (
+                hk_self._align_context_tokens(map_attn_slice)
+                if use_context and target_batch_index is not None and guidance_mode in ("cond", "uncond")
+                else None
+            )
 
             if use_context and target_batch_index is not None and aligned_map_attn_slice is not None and aligned_map_attn_slice.shape[1] > 0:
                 if factor >= 1:
                     maps = hk_self._up_sample_attn(aligned_map_attn_slice, value[start_idx:end_idx], factor)
-                    hk_self.heat_maps[target_batch_index][factor].append(maps)
+                    if guidance_mode == "uncond":
+                        hk_self.heat_maps_uncond[target_batch_index][factor].append(maps)
+                    else:
+                        hk_self.heat_maps[target_batch_index][factor].append(maps)
 
             hidden_states[start_idx:end_idx] = hid_states
 

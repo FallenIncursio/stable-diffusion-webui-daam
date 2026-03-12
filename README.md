@@ -15,6 +15,12 @@ This extension is a WebUI script port of [DAAM](https://github.com/castorini/daa
   - modes: `Disabled` (default), `All`, `Early`, `Mid`, `Late`, `Triplet`
 - `Triplet` mode renders `Early + Mid + Late` in one run.
 - Optional diagnostics JSON (`*_daam_diag.json`) with per-term match status and reason codes.
+- Prompt influence modes:
+  - `Positive`: visualize conditional prompt attention.
+  - `Negative`: visualize unconditional/negative prompt attention.
+  - `Delta (Pos-Neg)`: `max(0, positive - negative)` (suppression-aware positive remainder).
+  - `Signed Delta (Pos-Neg)`: signed `positive - negative` normalized to `[-1, 1]` and mapped to `[0, 1]`.
+  - `Abs Delta (|Pos-Neg|)`: absolute difference between positive and negative attention.
 - SDXL-compatible prompt token handling.
 - Forge-compatible UNet and text-encoder resolution.
 - Grid output mode for multiple attention terms.
@@ -43,6 +49,8 @@ Notes:
 - `All` means one aggregated heatmap over all denoising steps.
 - `Triplet` means three phase heatmaps (`Early`, `Mid`, `Late`) in one generation.
 - For `Triplet`, using `Use grid (output to grid dir)` is recommended for easier comparison.
+- `Delta (Pos-Neg)` can look empty if a term is only present in negative attention (`pos <= neg` everywhere after clamping).
+- Use `Signed Delta` or `Abs Delta` when you want to inspect suppression/conflict directly instead of only positive remainder.
 
 ## Forge Notes
 

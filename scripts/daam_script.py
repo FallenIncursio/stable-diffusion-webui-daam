@@ -56,6 +56,11 @@ class Script(scripts.Script):
     GRID_LAYOUT_AUTO = "Auto"
     GRID_LAYOUT_PREVENT_EMPTY = "Prevent Empty Spot"
     GRID_LAYOUT_BATCH_LENGTH_AS_ROW = "Batch Length As Row"
+    INFLUENCE_POSITIVE = "Positive"
+    INFLUENCE_NEGATIVE = "Negative"
+    INFLUENCE_DELTA = "Delta (Pos-Neg)"
+    INFLUENCE_DELTA_SIGNED = "Signed Delta (Pos-Neg)"
+    INFLUENCE_DELTA_ABS = "Abs Delta (|Pos-Neg|)"
     TIME_FOCUS_DISABLED = "Disabled"
     TIME_FOCUS_ALL = "All"
     TIME_FOCUS_EARLY = "Early"
@@ -278,19 +283,35 @@ class Script(scripts.Script):
             return cls.TIME_FOCUS_TRIPLET
         return cls.TIME_FOCUS_ALL
 
+    @classmethod
+    def _normalize_influence_mode(cls, value):
+        if not isinstance(value, str):
+            return cls.INFLUENCE_POSITIVE
+        normalized = value.strip().lower()
+        if normalized.startswith("negative"):
+            return cls.INFLUENCE_NEGATIVE
+        if normalized.startswith("signed delta") or ("signed" in normalized and "delta" in normalized):
+            return cls.INFLUENCE_DELTA_SIGNED
+        if normalized.startswith("abs delta") or normalized.startswith("absolute delta"):
+            return cls.INFLUENCE_DELTA_ABS
+        if normalized.startswith("delta"):
+            return cls.INFLUENCE_DELTA
+        return cls.INFLUENCE_POSITIVE
+
     def _parse_optional_daam_flags(self, enable_daam, extra_args, **kwargs):
         """
-        Parse optional Sprint-A flags while keeping old API payloads valid.
+        Parse optional DAAM flags while keeping old API payloads valid.
 
         Supported positional forms:
         - [enable_daam]
-        - [enable_daam, time_focus, enable_diagnostics]
+        - [enable_daam, time_focus, enable_diagnostics, influence_mode]
         - [time_focus, enable_diagnostics, enable_daam] (legacy sprint test payload)
         """
         parsed_enable = bool(enable_daam)
         parsed_focus = self.TIME_FOCUS_ALL
         parsed_diagnostics = False
         parsed_enable_time_focus = None
+        parsed_influence_mode = self.INFLUENCE_POSITIVE
         focus_explicit = False
 
         args = list(extra_args or [])
@@ -306,13 +327,16 @@ class Script(scripts.Script):
                 parsed_enable = args[0]
                 args = args[1:]
 
-        # Preferred new order: [enable_time_focus, time_focus, enable_diagnostics]
+        # Preferred new order: [enable_time_focus, time_focus, enable_diagnostics, influence_mode]
         if len(args) >= 3 and isinstance(args[0], bool) and isinstance(args[1], str) and isinstance(args[2], bool):
             parsed_enable_time_focus = args[0]
             parsed_focus = args[1]
             focus_explicit = True
             parsed_diagnostics = args[2]
             args = args[3:]
+            if len(args) >= 1 and isinstance(args[0], str):
+                parsed_influence_mode = args[0]
+                args = args[1:]
 
         # Legacy order from earlier tests: [time_focus, diagnostics, enable]
         elif len(args) >= 3 and isinstance(args[0], str) and isinstance(args[1], bool) and isinstance(args[2], bool):
@@ -321,6 +345,9 @@ class Script(scripts.Script):
             parsed_diagnostics = args[1]
             parsed_enable = args[2]
             args = args[3:]
+            if len(args) >= 1 and isinstance(args[0], str):
+                parsed_influence_mode = args[0]
+                args = args[1:]
         else:
             # Legacy order: [time_focus?, diagnostics?] after explicit enable_daam arg.
             if len(args) >= 1 and isinstance(args[0], str):
@@ -329,6 +356,9 @@ class Script(scripts.Script):
                 args = args[1:]
             if len(args) >= 1 and isinstance(args[0], bool):
                 parsed_diagnostics = args[0]
+                args = args[1:]
+            if len(args) >= 1 and isinstance(args[0], str):
+                parsed_influence_mode = args[0]
                 args = args[1:]
 
         if "enable_daam" in kwargs:
@@ -340,6 +370,10 @@ class Script(scripts.Script):
             parsed_enable_time_focus = bool(kwargs.get("enable_time_focus"))
         if "enable_diagnostics" in kwargs:
             parsed_diagnostics = bool(kwargs.get("enable_diagnostics"))
+        if "prompt_influence_mode" in kwargs:
+            parsed_influence_mode = kwargs.get("prompt_influence_mode")
+        if "influence_mode" in kwargs:
+            parsed_influence_mode = kwargs.get("influence_mode")
 
         if parsed_enable_time_focus is None:
             # Backward compatibility:
@@ -353,6 +387,7 @@ class Script(scripts.Script):
             bool(parsed_enable_time_focus),
             self._normalize_time_focus(parsed_focus),
             bool(parsed_diagnostics),
+            self._normalize_influence_mode(parsed_influence_mode),
             args,
         )
 
@@ -403,6 +438,96 @@ class Script(scripts.Script):
         if text_engine is None or not prompt_text:
             return None
         return utils.PromptAnalyzer(text_engine, prompt_text)
+
+    def _get_negative_prompt_analyzer_for_batch(self, batch_pos: int, prompt_text: str):
+        analyzers = getattr(self, "negative_prompt_analyzers", None)
+        if isinstance(analyzers, list) and len(analyzers) > 0:
+            if 0 <= batch_pos < len(analyzers):
+                return analyzers[batch_pos]
+            return analyzers[0]
+
+        if not prompt_text:
+            return None
+
+        cache = getattr(self, "negative_prompt_analyzer_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self.negative_prompt_analyzer_cache = cache
+
+        if prompt_text in cache:
+            return cache[prompt_text]
+
+        text_engine = getattr(self, "text_engine", None)
+        if text_engine is None:
+            return None
+
+        analyzer = utils.PromptAnalyzer(text_engine, prompt_text)
+        cache[prompt_text] = analyzer
+        return analyzer
+
+    @staticmethod
+    def _compute_word_heat_map_from_candidates(global_heat_map, candidates):
+        if global_heat_map is None:
+            return None, None
+        for candidate in candidates:
+            heat_map = global_heat_map.compute_word_heat_map(candidate)
+            if heat_map is not None:
+                return heat_map, candidate
+        return None, None
+
+    @staticmethod
+    def _prepare_delta_maps(positive_map, negative_map):
+        if positive_map is None and negative_map is None:
+            return None, None
+
+        reference = positive_map if positive_map is not None else negative_map
+        if reference is None:
+            return None, None
+
+        if positive_map is None:
+            positive_map = torch.zeros_like(reference)
+        if negative_map is None:
+            negative_map = torch.zeros_like(reference)
+        return positive_map, negative_map
+
+    @classmethod
+    def _compute_delta_heat_map(cls, positive_map, negative_map):
+        positive_map, negative_map = cls._prepare_delta_maps(positive_map, negative_map)
+        if positive_map is None:
+            return None
+
+        delta = torch.clamp(positive_map - negative_map, min=0.0)
+        max_value = float(delta.max().item()) if delta.numel() > 0 else 0.0
+        if max_value > 0:
+            delta = delta / max_value
+        return delta
+
+    @classmethod
+    def _compute_abs_delta_heat_map(cls, positive_map, negative_map):
+        positive_map, negative_map = cls._prepare_delta_maps(positive_map, negative_map)
+        if positive_map is None:
+            return None
+
+        delta = torch.abs(positive_map - negative_map)
+        max_value = float(delta.max().item()) if delta.numel() > 0 else 0.0
+        if max_value <= 0:
+            return None
+        return delta / max_value
+
+    @classmethod
+    def _compute_signed_delta_heat_map(cls, positive_map, negative_map):
+        positive_map, negative_map = cls._prepare_delta_maps(positive_map, negative_map)
+        if positive_map is None:
+            return None
+
+        signed = positive_map - negative_map
+        max_abs = float(signed.abs().max().item()) if signed.numel() > 0 else 0.0
+        if max_abs <= 0:
+            return None
+        signed = signed / max_abs
+        # Map [-1, 1] -> [0, 1] so the existing heatmap renderer can colorize it.
+        signed = (signed + 1.0) * 0.5
+        return torch.clamp(signed, min=0.0, max=1.0)
 
     def _resolve_focus_kwargs(self, tracer, focus_override=None):
         time_focus = self._normalize_time_focus(
@@ -638,6 +763,34 @@ class Script(scripts.Script):
             return prompt_text[0] if len(prompt_text) > 0 else ""
         return prompt_text or ""
 
+    def _resolve_effective_negative_prompt(self, params, batch_pos: int):
+        p = getattr(params, "p", None)
+        negative_prompts = getattr(p, "negative_prompts", None)
+        if isinstance(negative_prompts, (list, tuple)) and len(negative_prompts) > 0:
+            if 0 <= batch_pos < len(negative_prompts):
+                return negative_prompts[batch_pos]
+            return negative_prompts[0]
+        if isinstance(negative_prompts, str) and negative_prompts:
+            return negative_prompts
+
+        all_negative_prompts = getattr(p, "all_negative_prompts", None)
+        if isinstance(all_negative_prompts, (list, tuple)) and len(all_negative_prompts) > 0:
+            seed = self._extract_seed_from_filename(getattr(params, "filename", ""))
+            if seed is not None:
+                idx = self._index_in_seed_list(getattr(p, "all_seeds", None), seed)
+                if isinstance(idx, int) and 0 <= idx < len(all_negative_prompts):
+                    return all_negative_prompts[idx]
+            if 0 <= self.saved_sample_count < len(all_negative_prompts):
+                return all_negative_prompts[self.saved_sample_count]
+            if 0 <= batch_pos < len(all_negative_prompts):
+                return all_negative_prompts[batch_pos]
+            return all_negative_prompts[0]
+
+        negative_prompt_text = getattr(p, "negative_prompt", "")
+        if isinstance(negative_prompt_text, (list, tuple)):
+            return negative_prompt_text[0] if len(negative_prompt_text) > 0 else ""
+        return negative_prompt_text or ""
+
     def ui(self, is_img2img):
         with gr.Group():
             with gr.Accordion("Attention Heatmap", open=False):
@@ -686,6 +839,19 @@ class Script(scripts.Script):
                     )
 
                 with gr.Row():
+                    prompt_influence_mode = gr.Dropdown(
+                        [
+                            Script.INFLUENCE_POSITIVE,
+                            Script.INFLUENCE_NEGATIVE,
+                            Script.INFLUENCE_DELTA,
+                            Script.INFLUENCE_DELTA_SIGNED,
+                            Script.INFLUENCE_DELTA_ABS,
+                        ],
+                        label="Prompt influence mode",
+                        value=Script.INFLUENCE_POSITIVE,
+                    )
+
+                with gr.Row():
                     enable_diagnostics = gr.Checkbox(label='Enable diagnostics', value=False)
         
         
@@ -693,7 +859,23 @@ class Script(scripts.Script):
         self.run_active = False
         
         # Keep enable toggle at index 10 for API backward compatibility.
-        return [attention_texts, hide_images, dont_save_images, hide_caption, use_grid, grid_layouyt, alpha, heatmap_image_scale, trace_each_layers, layers_as_row, enable_daam, enable_time_focus, time_focus, enable_diagnostics] 
+        return [
+            attention_texts,
+            hide_images,
+            dont_save_images,
+            hide_caption,
+            use_grid,
+            grid_layouyt,
+            alpha,
+            heatmap_image_scale,
+            trace_each_layers,
+            layers_as_row,
+            enable_daam,
+            enable_time_focus,
+            time_focus,
+            enable_diagnostics,
+            prompt_influence_mode,
+        ]
     
     def process(self, 
             p : StableDiffusionProcessing, 
@@ -710,7 +892,7 @@ class Script(scripts.Script):
             enable_daam: bool = True,
             *extra_args,
             **kwargs):
-        enable_daam, enable_time_focus, time_focus, enable_diagnostics, _ = self._parse_optional_daam_flags(
+        enable_daam, enable_time_focus, time_focus, enable_diagnostics, influence_mode, _ = self._parse_optional_daam_flags(
             enable_daam, extra_args, **kwargs
         )
         attentions = self._split_attention_texts(attention_texts)
@@ -737,7 +919,10 @@ class Script(scripts.Script):
         self.enable_time_focus = enable_time_focus
         self.time_focus = time_focus
         self.enable_diagnostics = enable_diagnostics
+        self.influence_mode = influence_mode
         self.prompt_analyzers = []
+        self.negative_prompt_analyzers = []
+        self.negative_prompt_analyzer_cache = {}
         self.text_engine = None
 
         self.attentions = attentions
@@ -771,7 +956,7 @@ class Script(scripts.Script):
             *extra_args,
             prompts=None,
             **kwargs):
-        enable_daam, enable_time_focus, time_focus, enable_diagnostics, remaining_args = self._parse_optional_daam_flags(
+        enable_daam, enable_time_focus, time_focus, enable_diagnostics, influence_mode, remaining_args = self._parse_optional_daam_flags(
             enable_daam, extra_args, **kwargs
         )
         prompts = self._resolve_batch_prompts(prompts, remaining_args, kwargs)
@@ -779,6 +964,7 @@ class Script(scripts.Script):
         self.enable_time_focus = enable_time_focus
         self.time_focus = time_focus
         self.enable_diagnostics = enable_diagnostics
+        self.influence_mode = influence_mode
 
         if not enable_daam:
             return
@@ -806,6 +992,8 @@ class Script(scripts.Script):
         self.text_engine = text_engine
 
         self.prompt_analyzers = []
+        self.negative_prompt_analyzers = []
+        self.negative_prompt_analyzer_cache = {}
         context_size = 77
         for prompt_text in prompts_list:
             if not isinstance(prompt_text, str):
@@ -820,13 +1008,30 @@ class Script(scripts.Script):
 
         self.prompt_analyzer = self.prompt_analyzers[0]
 
+        negative_prompts = getattr(p, "negative_prompts", None)
+        if isinstance(negative_prompts, (list, tuple)):
+            negative_prompt_list = [self._canonicalize_prompt_for_daam(x) for x in list(negative_prompts)]
+        elif isinstance(negative_prompts, str):
+            negative_prompt_list = [self._canonicalize_prompt_for_daam(negative_prompts)]
+        else:
+            negative_prompt_text = getattr(p, "negative_prompt", None)
+            if isinstance(negative_prompt_text, str):
+                negative_prompt_list = [self._canonicalize_prompt_for_daam(negative_prompt_text)]
+            else:
+                negative_prompt_list = []
+
+        for negative_prompt in negative_prompt_list:
+            if isinstance(negative_prompt, str) and negative_prompt.strip():
+                self.negative_prompt_analyzers.append(utils.PromptAnalyzer(text_engine, negative_prompt))
+
         diffusion_model = _resolve_diffusion_model(p.sd_model)
                 
         first_analyzer = self.prompt_analyzer
         print(
             f"daam run with context_size={context_size}, token_count={first_analyzer.token_count}, "
             f"time_focus_enabled={self.enable_time_focus}, time_focus={self.time_focus}, "
-            f"diagnostics={self.enable_diagnostics}, batch_prompts={len(prompts_list)}"
+            f"influence_mode={self.influence_mode}, diagnostics={self.enable_diagnostics}, "
+            f"batch_prompts={len(prompts_list)}"
         )
         print(f"remade_tokens={first_analyzer.tokens}, multipliers={first_analyzer.multipliers}")
         print(f"hijack_comments={first_analyzer.hijack_comments}, used_custom_terms={first_analyzer.used_custom_terms}")
@@ -869,7 +1074,7 @@ class Script(scripts.Script):
             enable_daam: bool = True,
             *extra_args,
             **kwargs):
-        _, self.enable_time_focus, self.time_focus, self.enable_diagnostics, _ = self._parse_optional_daam_flags(
+        _, self.enable_time_focus, self.time_focus, self.enable_diagnostics, self.influence_mode, _ = self._parse_optional_daam_flags(
             enable_daam, extra_args, **kwargs
         )
         if self.enabled == False:
@@ -965,65 +1170,197 @@ class Script(scripts.Script):
                     prompt_analyzer = self._get_prompt_analyzer_for_batch(batch_pos, styled_prompt)
                     if prompt_analyzer is None:
                         continue
+                    effective_negative_prompt = self._resolve_effective_negative_prompt(params, batch_pos)
+                    styled_negative_prompt = self._canonicalize_prompt_for_daam(effective_negative_prompt)
+                    negative_prompt_analyzer = self._get_negative_prompt_analyzer_for_batch(batch_pos, styled_negative_prompt)
+                    influence_mode = self._normalize_influence_mode(
+                        getattr(self, "influence_mode", self.INFLUENCE_POSITIVE)
+                    )
+
                     if i not in self.heatmap_images:
                         self.heatmap_images[i] = []
 
                     heatmap_images = []
                     for focus_label, focus_kwargs in self._resolve_focus_targets(tracer):
+                        positive_global_heat_map = None
+                        negative_global_heat_map = None
                         try:
-                            global_heat_map = tracer.compute_global_heat_map(
-                                prompt_analyzer, styled_prompt, batch_pos, **focus_kwargs
-                            )
+                            if influence_mode == self.INFLUENCE_NEGATIVE:
+                                if negative_prompt_analyzer is not None:
+                                    negative_global_heat_map = tracer.compute_global_heat_map(
+                                        negative_prompt_analyzer,
+                                        styled_negative_prompt,
+                                        batch_pos,
+                                        guidance_mode="uncond",
+                                        **focus_kwargs,
+                                    )
+                            elif influence_mode in (
+                                self.INFLUENCE_DELTA,
+                                self.INFLUENCE_DELTA_SIGNED,
+                                self.INFLUENCE_DELTA_ABS,
+                            ):
+                                positive_global_heat_map = tracer.compute_global_heat_map(
+                                    prompt_analyzer, styled_prompt, batch_pos, guidance_mode="cond", **focus_kwargs
+                                )
+                                if negative_prompt_analyzer is not None:
+                                    negative_global_heat_map = tracer.compute_global_heat_map(
+                                        negative_prompt_analyzer,
+                                        styled_negative_prompt,
+                                        batch_pos,
+                                        guidance_mode="uncond",
+                                        **focus_kwargs,
+                                    )
+                            else:
+                                positive_global_heat_map = tracer.compute_global_heat_map(
+                                    prompt_analyzer, styled_prompt, batch_pos, guidance_mode="cond", **focus_kwargs
+                                )
                         except Exception:
                             continue
 
-                        if global_heat_map is None:
+                        if (
+                            influence_mode == self.INFLUENCE_POSITIVE
+                            and positive_global_heat_map is None
+                        ):
+                            continue
+                        if (
+                            influence_mode == self.INFLUENCE_NEGATIVE
+                            and negative_global_heat_map is None
+                        ):
+                            continue
+                        if (
+                            influence_mode
+                            in (
+                                self.INFLUENCE_DELTA,
+                                self.INFLUENCE_DELTA_SIGNED,
+                                self.INFLUENCE_DELTA_ABS,
+                            )
+                            and positive_global_heat_map is None
+                            and negative_global_heat_map is None
+                        ):
                             continue
 
                         for raw_attention in self.attentions:
-                            attention = self._resolve_attention_term(raw_attention, styled_prompt)
+                            resolve_base_prompt = (
+                                styled_negative_prompt
+                                if influence_mode == self.INFLUENCE_NEGATIVE and styled_negative_prompt
+                                else styled_prompt
+                            )
+                            attention = self._resolve_attention_term(raw_attention, resolve_base_prompt)
                             attn_candidates = self._attention_candidates(raw_attention, attention)
 
                             img_size = params.image.size
                             attn_caption = self.attn_captions[i] if i < len(self.attn_captions) else ""
+                            caption_tags = []
                             focus_caption = focus_label if getattr(self, "enable_time_focus", False) else ""
+                            if focus_caption:
+                                caption_tags.append(focus_caption)
+                            if influence_mode != self.INFLUENCE_POSITIVE:
+                                caption_tags.append(influence_mode.split(" ")[0])
+                            mode_caption = "|".join(caption_tags)
                             caption = (
                                 attention
                                 + (" " + attn_caption if attn_caption else "")
-                                + (f" [{focus_caption}]" if focus_caption else "")
+                                + (f" [{mode_caption}]" if mode_caption else "")
                                 if not self.hide_caption
                                 else None
                             )
 
                             heat_map = None
                             matched_candidate = None
-                            for candidate in attn_candidates:
-                                heat_map = global_heat_map.compute_word_heat_map(candidate)
-                                if heat_map is not None:
-                                    matched_candidate = candidate
-                                    break
                             reason = "ok"
-                            if heat_map is None:
-                                reason = self._diagnose_missing_heatmap(
-                                    raw_attention, attention, attn_candidates, styled_prompt, prompt_analyzer
+                            delta_detail = None
+
+                            if influence_mode == self.INFLUENCE_NEGATIVE:
+                                heat_map, matched_candidate = self._compute_word_heat_map_from_candidates(
+                                    negative_global_heat_map, attn_candidates
                                 )
+                                if heat_map is None:
+                                    reason = self._diagnose_missing_heatmap(
+                                        raw_attention,
+                                        attention,
+                                        attn_candidates,
+                                        styled_negative_prompt,
+                                        negative_prompt_analyzer,
+                                    )
+                            elif influence_mode in (
+                                self.INFLUENCE_DELTA,
+                                self.INFLUENCE_DELTA_SIGNED,
+                                self.INFLUENCE_DELTA_ABS,
+                            ):
+                                pos_map, pos_candidate = self._compute_word_heat_map_from_candidates(
+                                    positive_global_heat_map, attn_candidates
+                                )
+                                neg_map, neg_candidate = self._compute_word_heat_map_from_candidates(
+                                    negative_global_heat_map, attn_candidates
+                                )
+                                if influence_mode == self.INFLUENCE_DELTA_SIGNED:
+                                    heat_map = self._compute_signed_delta_heat_map(pos_map, neg_map)
+                                elif influence_mode == self.INFLUENCE_DELTA_ABS:
+                                    heat_map = self._compute_abs_delta_heat_map(pos_map, neg_map)
+                                else:
+                                    heat_map = self._compute_delta_heat_map(pos_map, neg_map)
+                                matched_candidate = pos_candidate if pos_candidate is not None else neg_candidate
+                                if heat_map is None:
+                                    pos_reason = self._diagnose_missing_heatmap(
+                                        raw_attention,
+                                        attention,
+                                        attn_candidates,
+                                        styled_prompt,
+                                        prompt_analyzer,
+                                    )
+                                    neg_reason = self._diagnose_missing_heatmap(
+                                        raw_attention,
+                                        attention,
+                                        attn_candidates,
+                                        styled_negative_prompt,
+                                        negative_prompt_analyzer,
+                                    )
+                                    reason = "delta_missing_both"
+                                else:
+                                    pos_reason = "ok" if pos_map is not None else "positive_missing"
+                                    neg_reason = "ok" if neg_map is not None else "negative_missing"
+                                delta_detail = {
+                                    "positive_matched": pos_map is not None,
+                                    "negative_matched": neg_map is not None,
+                                    "positive_candidate": pos_candidate,
+                                    "negative_candidate": neg_candidate,
+                                    "positive_reason": pos_reason,
+                                    "negative_reason": neg_reason,
+                                }
+                            else:
+                                heat_map, matched_candidate = self._compute_word_heat_map_from_candidates(
+                                    positive_global_heat_map, attn_candidates
+                                )
+                                if heat_map is None:
+                                    reason = self._diagnose_missing_heatmap(
+                                        raw_attention,
+                                        attention,
+                                        attn_candidates,
+                                        styled_prompt,
+                                        prompt_analyzer,
+                                    )
+
+                            if heat_map is None:
                                 print(
                                     f"No heatmaps for '{raw_attention}' "
-                                    f"(resolved='{attention}', focus={focus_label}, reason={reason})"
+                                    f"(resolved='{attention}', focus={focus_label}, mode={influence_mode}, reason={reason})"
                                 )
+
                             if self.enable_diagnostics:
-                                diagnostics_entries.append(
-                                    {
-                                        "layer": attn_caption or "ALL",
-                                        "focus": focus_label,
-                                        "raw_attention": raw_attention,
-                                        "resolved_attention": attention,
-                                        "candidates": attn_candidates,
-                                        "matched": heat_map is not None,
-                                        "matched_candidate": matched_candidate,
-                                        "reason": reason,
-                                    }
-                                )
+                                entry = {
+                                    "layer": attn_caption or "ALL",
+                                    "focus": focus_label,
+                                    "influence_mode": influence_mode,
+                                    "raw_attention": raw_attention,
+                                    "resolved_attention": attention,
+                                    "candidates": attn_candidates,
+                                    "matched": heat_map is not None,
+                                    "matched_candidate": matched_candidate,
+                                    "reason": reason,
+                                }
+                                if delta_detail is not None:
+                                    entry.update(delta_detail)
+                                diagnostics_entries.append(entry)
 
                             heat_map_img = (
                                 utils.expand_image(heat_map, img_size[1], img_size[0]) if heat_map is not None else None
@@ -1040,11 +1377,17 @@ class Script(scripts.Script):
                             filename_attention = self._sanitize_filename_fragment(attention)
                             filename_caption = self._sanitize_filename_fragment(attn_caption) if attn_caption else ""
                             filename_focus = self._sanitize_filename_fragment(focus_caption) if focus_caption else ""
+                            filename_influence = (
+                                self._sanitize_filename_fragment(influence_mode)
+                                if influence_mode != self.INFLUENCE_POSITIVE
+                                else ""
+                            )
                             full_filename = (
                                 fullfn_without_extension
                                 + "_"
                                 + filename_attention
                                 + ("_" + filename_focus if filename_focus else "")
+                                + ("_" + filename_influence if filename_influence else "")
                                 + ("_" + filename_caption if filename_caption else "")
                                 + extension
                             )
@@ -1066,7 +1409,9 @@ class Script(scripts.Script):
                     "batch_pos": batch_pos,
                     "enable_time_focus": self.enable_time_focus,
                     "time_focus": self.time_focus,
+                    "influence_mode": self.influence_mode,
                     "prompt": styled_prompt,
+                    "negative_prompt": styled_negative_prompt,
                     "entries": diagnostics_entries,
                 }
                 self._save_diagnostics(params, diagnostics_payload)
