@@ -1,4 +1,5 @@
 from __future__ import annotations
+import glob
 import os
 import re
 
@@ -9,7 +10,6 @@ import torch
 from modules import script_callbacks
 from modules.processing import StableDiffusionProcessing, fix_seed
 from modules.shared import opts
-import modules.shared as shared
 from PIL import Image
 
 from scripts.daam import trace, utils
@@ -56,6 +56,10 @@ class Script(scripts.Script):
     GRID_LAYOUT_PREVENT_EMPTY = "Prevent Empty Spot"
     GRID_LAYOUT_BATCH_LENGTH_AS_ROW = "Batch Length As Row"
     _warned_output_overlap = False
+    _invalid_filename_chars = re.compile(r'[<>:"/\\|?*\x00-\x1F]+')
+    _break_regex = re.compile(r"\bBREAK\b", flags=re.IGNORECASE)
+    _variant_block_regex = re.compile(r"\{[^{}]*\|[^{}]*\}|\[[^\[\]]*\|[^\[\]]*\]")
+    _wildcard_token_regex = re.compile(r"__([A-Za-z0-9_\-./\\*\[\]?]+)__")
     
 
     def title(self):
@@ -70,6 +74,184 @@ class Script(scripts.Script):
         for tracer in self.tracers:
             if getattr(tracer, "hooked", False):
                 tracer.unhook()
+
+    @classmethod
+    def _split_attention_texts(cls, attention_texts: str):
+        normalized = cls._break_regex.sub(",", attention_texts or "")
+        return [s.strip() for s in normalized.split(",") if s.strip()]
+
+    @classmethod
+    def _normalize_for_match(cls, text: str):
+        if not text:
+            return ""
+        normalized = text.lower()
+        normalized = cls._break_regex.sub(" ", normalized)
+        normalized = re.sub(r"<lora:[^>]+>", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    @classmethod
+    def _contains_phrase(cls, prompt: str, phrase: str):
+        prompt_n = cls._normalize_for_match(prompt)
+        phrase_n = cls._normalize_for_match(phrase)
+        if not prompt_n or not phrase_n:
+            return False
+        return phrase_n in prompt_n
+
+    @classmethod
+    def _best_prompt_match(cls, prompt: str, candidates):
+        best = None
+        best_len = -1
+        for candidate in candidates:
+            candidate = (candidate or "").strip()
+            if not candidate:
+                continue
+            if cls._contains_phrase(prompt, candidate):
+                candidate_len = len(candidate)
+                if candidate_len > best_len:
+                    best = candidate
+                    best_len = candidate_len
+        return best
+
+    @classmethod
+    def _extract_variant_options(cls, token: str):
+        token = (token or "").strip()
+        if len(token) < 3:
+            return []
+        if not ((token.startswith("{") and token.endswith("}")) or (token.startswith("[") and token.endswith("]"))):
+            return []
+        inner = token[1:-1].strip()
+        if "|" not in inner:
+            return []
+        # Dynamic prompts can prefix range/joiner blocks with '$$'.
+        if "$$" in inner:
+            inner = inner.rsplit("$$", 1)[-1]
+        options = []
+        for opt in inner.split("|"):
+            cleaned = re.sub(r"^\s*[-+]?\d+(?:\.\d+)?::", "", opt).strip()
+            if cleaned:
+                options.append(cleaned)
+        return options
+
+    @staticmethod
+    def _get_webui_root():
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+    @classmethod
+    def _get_wildcard_dirs(cls):
+        wildcard_dirs = []
+        configured_wildcard_dir = getattr(opts, "wildcard_dir", None)
+        if configured_wildcard_dir:
+            wildcard_dirs.append(os.path.abspath(configured_wildcard_dir))
+        wildcard_dirs.append(
+            os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "sd-dynamic-prompts", "wildcards")
+            )
+        )
+        wildcard_dirs.append(os.path.join(cls._get_webui_root(), "wildcards"))
+        deduped = []
+        for wildcard_dir in wildcard_dirs:
+            if wildcard_dir and wildcard_dir not in deduped and os.path.isdir(wildcard_dir):
+                deduped.append(wildcard_dir)
+        return deduped
+
+    @classmethod
+    def _load_wildcard_values(cls, wildcard_name: str):
+        wildcard_name = (wildcard_name or "").strip().replace("\\", "/")
+        if not wildcard_name:
+            return []
+        has_glob = any(ch in wildcard_name for ch in ("*", "?", "["))
+        values = []
+        seen = set()
+        for wildcard_dir in cls._get_wildcard_dirs():
+            patterns = []
+            if wildcard_name.endswith(".txt"):
+                patterns.append(os.path.join(wildcard_dir, wildcard_name))
+            else:
+                patterns.append(os.path.join(wildcard_dir, wildcard_name + ".txt"))
+            if has_glob:
+                wildcard_pattern = wildcard_name if wildcard_name.endswith(".txt") else wildcard_name + ".txt"
+                patterns.append(os.path.join(wildcard_dir, "**", wildcard_pattern))
+            for pattern in patterns:
+                for wildcard_file in glob.glob(pattern, recursive=has_glob):
+                    if not os.path.isfile(wildcard_file):
+                        continue
+                    try:
+                        with open(wildcard_file, "r", encoding="utf-8", errors="ignore") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith("#"):
+                                    continue
+                                if line not in seen:
+                                    seen.add(line)
+                                    values.append(line)
+                    except Exception:
+                        continue
+        return values
+
+    @classmethod
+    def _resolve_variant_blocks(cls, text: str, prompt: str):
+        def _replace(match: re.Match):
+            token = match.group(0)
+            options = cls._extract_variant_options(token)
+            if not options:
+                return token
+            best = cls._best_prompt_match(prompt, options)
+            return best if best is not None else options[0]
+
+        return cls._variant_block_regex.sub(_replace, text)
+
+    @classmethod
+    def _resolve_wildcard_tokens(cls, text: str, prompt: str):
+        def _replace(match: re.Match):
+            wildcard_name = match.group(1)
+            candidates = cls._load_wildcard_values(wildcard_name)
+            if not candidates:
+                return match.group(0)
+            best = cls._best_prompt_match(prompt, candidates)
+            return best if best is not None else match.group(0)
+
+        return cls._wildcard_token_regex.sub(_replace, text)
+
+    @classmethod
+    def _resolve_attention_term(cls, raw_attention: str, prompt: str):
+        attention = (raw_attention or "").strip()
+        if not attention:
+            return ""
+        if not prompt:
+            return cls._break_regex.sub(" ", attention).strip()
+        resolved = cls._resolve_variant_blocks(attention, prompt)
+        resolved = cls._resolve_wildcard_tokens(resolved, prompt)
+        resolved = cls._break_regex.sub(" ", resolved)
+        resolved = re.sub(r"\s+", " ", resolved).strip(" ,")
+        return resolved if resolved else attention
+
+    @classmethod
+    def _attention_candidates(cls, raw_attention: str, resolved_attention: str):
+        candidates = []
+        for term in (resolved_attention, raw_attention):
+            term = (term or "").strip()
+            if not term:
+                continue
+            candidates.append(cls._break_regex.sub(" ", term).strip(" ,"))
+            for piece in re.split(r",", cls._break_regex.sub(",", term)):
+                piece = piece.strip()
+                if piece:
+                    candidates.append(piece)
+        deduped = []
+        seen = set()
+        for candidate in candidates:
+            key = candidate.lower()
+            if candidate and key not in seen:
+                seen.add(key)
+                deduped.append(candidate)
+        return deduped
+
+    @classmethod
+    def _sanitize_filename_fragment(cls, text: str):
+        text = cls._invalid_filename_chars.sub("_", (text or "").strip())
+        text = re.sub(r"\s+", " ", text).strip().strip(".")
+        return text or "attention"
 
     @staticmethod
     def _is_dummy_postprocess_call(processed):
@@ -177,6 +359,34 @@ class Script(scripts.Script):
         # Last-resort fallback: monotonically assign save callbacks into batch slots.
         return self.saved_sample_count % batch_size
 
+    def _resolve_effective_prompt(self, params, batch_pos: int):
+        p = getattr(params, "p", None)
+        prompts = getattr(p, "prompts", None)
+        if isinstance(prompts, (list, tuple)) and len(prompts) > 0:
+            if 0 <= batch_pos < len(prompts):
+                return prompts[batch_pos]
+            return prompts[0]
+        if isinstance(prompts, str) and prompts:
+            return prompts
+
+        all_prompts = getattr(p, "all_prompts", None)
+        if isinstance(all_prompts, (list, tuple)) and len(all_prompts) > 0:
+            seed = self._extract_seed_from_filename(getattr(params, "filename", ""))
+            if seed is not None:
+                idx = self._index_in_seed_list(getattr(p, "all_seeds", None), seed)
+                if isinstance(idx, int) and 0 <= idx < len(all_prompts):
+                    return all_prompts[idx]
+            if 0 <= self.saved_sample_count < len(all_prompts):
+                return all_prompts[self.saved_sample_count]
+            if 0 <= batch_pos < len(all_prompts):
+                return all_prompts[batch_pos]
+            return all_prompts[0]
+
+        prompt_text = getattr(p, "prompt", "")
+        if isinstance(prompt_text, (list, tuple)):
+            return prompt_text[0] if len(prompt_text) > 0 else ""
+        return prompt_text or ""
+
     def ui(self, is_img2img):
         with gr.Group():
             with gr.Accordion("Attention Heatmap", open=False):
@@ -228,7 +438,7 @@ class Script(scripts.Script):
             trace_each_layers : bool,
             layers_as_row: bool,
             enable_daam: bool = True):
-        attentions = [s.strip() for s in attention_texts.split(",") if s.strip()]
+        attentions = self._split_attention_texts(attention_texts)
 
         # ADetailer can trigger nested script.process() calls during a running txt2img pass.
         # Do not reset DAAM state in that case, otherwise accumulated batch heatmaps are lost.
@@ -441,8 +651,7 @@ class Script(scripts.Script):
         if self.tracers is not None and len(self.attentions) > 0:
             for i, tracer in enumerate(self.tracers):
                 with torch.no_grad():
-                    prompt_text = params.p.prompt[0] if isinstance(params.p.prompt, list) else params.p.prompt
-                    styled_prompt = shared.prompt_styles.apply_styles_to_prompt(prompt_text, params.p.styles)
+                    styled_prompt = self._resolve_effective_prompt(params, batch_pos)
                     try:
                         global_heat_map = tracer.compute_global_heat_map(self.prompt_analyzer, styled_prompt, batch_pos)              
                     except Exception:
@@ -453,20 +662,28 @@ class Script(scripts.Script):
                     
                     if global_heat_map is not None:
                         heatmap_images = []
-                        for attention in self.attentions:
-                                    
+                        for raw_attention in self.attentions:
+                            attention = self._resolve_attention_term(raw_attention, styled_prompt)
+                            attn_candidates = self._attention_candidates(raw_attention, attention)
+                                     
                             img_size = params.image.size
                             attn_caption = self.attn_captions[i] if i < len(self.attn_captions) else ""
                             caption = attention + (" " + attn_caption if attn_caption else "") if not self.hide_caption else None
                             
-                            heat_map = global_heat_map.compute_word_heat_map(attention)
-                            if heat_map is None : print(f"No heatmaps for '{attention}'")
-                            
+                            heat_map = None
+                            for candidate in attn_candidates:
+                                heat_map = global_heat_map.compute_word_heat_map(candidate)
+                                if heat_map is not None:
+                                    break
+                            if heat_map is None : print(f"No heatmaps for '{raw_attention}' (resolved='{attention}')")
+                             
                             heat_map_img = utils.expand_image(heat_map, img_size[1], img_size[0]) if heat_map is not None else None
                             img : Image.Image = utils.image_overlay_heat_map(params.image, heat_map_img, alpha=self.alpha, caption=caption, image_scale=self.heatmap_image_scale)
 
                             fullfn_without_extension, extension = os.path.splitext(params.filename) 
-                            full_filename = fullfn_without_extension + "_" + attention +  ("_" + attn_caption if attn_caption else "") + extension
+                            filename_attention = self._sanitize_filename_fragment(attention)
+                            filename_caption = self._sanitize_filename_fragment(attn_caption) if attn_caption else ""
+                            full_filename = fullfn_without_extension + "_" + filename_attention +  ("_" + filename_caption if filename_caption else "") + extension
                             
                             if self.use_grid:
                                 heatmap_images.append(img)

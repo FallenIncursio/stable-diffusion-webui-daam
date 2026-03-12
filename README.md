@@ -5,6 +5,10 @@ This extension is a WebUI script port of [DAAM](https://github.com/castorini/daa
 ## Features
 
 - Attention heatmaps for comma-separated target phrases.
+- `BREAK` is also treated as a separator in attention text input.
+- Dynamic Prompts term resolution for attention targets:
+  - Variant blocks like `{red eyes|blue eyes}` / `[red eyes|blue eyes]`
+  - Wildcard tokens like `__eye_color__` (resolved against wildcard files)
 - Explicit `Enable DAAM` toggle (on/off like other always-on scripts).
 - SDXL-compatible prompt token handling.
 - Forge-compatible UNet and text-encoder resolution.
@@ -27,7 +31,10 @@ The extension creates blended heatmap images and, if enabled, a `grid_daam-*.png
 Notes:
 
 - Multi-word phrases are matched as one sequence (for example `white dress`).
+- You can separate attention targets with `,` or `BREAK`.
+- For Dynamic Prompts, DAAM matches against the resolved per-image prompt text.
 - For reliable DAAM matching with LoRA, place LoRA at the very end of the positive prompt, after terms you want to visualize.
+- For API generation, set `"save_images": true` so save hooks run and DAAM heatmaps are produced.
 
 ## Forge Notes
 
