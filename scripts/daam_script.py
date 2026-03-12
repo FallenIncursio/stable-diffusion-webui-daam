@@ -60,6 +60,7 @@ class Script(scripts.Script):
     _break_regex = re.compile(r"\bBREAK\b", flags=re.IGNORECASE)
     _variant_block_regex = re.compile(r"\{[^{}]*\|[^{}]*\}|\[[^\[\]]*\|[^\[\]]*\]")
     _wildcard_token_regex = re.compile(r"__([A-Za-z0-9_\-./\\*\[\]?]+)__")
+    _extra_network_tag_regex = re.compile(r"<[^<>:]+:[^<>]+>")
     
 
     def title(self):
@@ -252,6 +253,31 @@ class Script(scripts.Script):
         text = cls._invalid_filename_chars.sub("_", (text or "").strip())
         text = re.sub(r"\s+", " ", text).strip().strip(".")
         return text or "attention"
+
+    @classmethod
+    def _canonicalize_prompt_for_daam(cls, prompt: str):
+        """
+        Normalize extra-network tag placement for token alignment.
+        Forge can expose slightly different chunking when tags (for example LoRA)
+        are placed at the start of the prompt, which can destabilize DAAM mapping.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return prompt
+
+        tags = cls._extra_network_tag_regex.findall(prompt)
+        text_wo_tags = cls._extra_network_tag_regex.sub(" ", prompt)
+        text_wo_tags = re.sub(r"\s*,\s*", ", ", text_wo_tags)
+        text_wo_tags = re.sub(r",\s*,+", ", ", text_wo_tags)
+        text_wo_tags = re.sub(r"\s+", " ", text_wo_tags).strip(" ,")
+
+        if not tags:
+            return text_wo_tags
+
+        tag_tail = ", ".join(tag.strip() for tag in tags if tag.strip())
+        if not text_wo_tags:
+            return tag_tail
+        return f"{text_wo_tags}, {tag_tail}"
 
     @staticmethod
     def _is_dummy_postprocess_call(processed):
@@ -512,6 +538,14 @@ class Script(scripts.Script):
         if not prompts:
             return
 
+        # Normalize batch prompts in-place so LoRA/extra-network tags are treated
+        # consistently regardless of their original position in the user prompt.
+        if isinstance(prompts, list):
+            for idx, prompt in enumerate(prompts):
+                prompts[idx] = self._canonicalize_prompt_for_daam(prompt)
+        elif isinstance(prompts, tuple):
+            prompts = tuple(self._canonicalize_prompt_for_daam(prompt) for prompt in prompts)
+
         styled_prompt = prompts[0]
 
         text_engine = _resolve_text_engine(p.sd_model)
@@ -651,7 +685,8 @@ class Script(scripts.Script):
         if self.tracers is not None and len(self.attentions) > 0:
             for i, tracer in enumerate(self.tracers):
                 with torch.no_grad():
-                    styled_prompt = self._resolve_effective_prompt(params, batch_pos)
+                    effective_prompt = self._resolve_effective_prompt(params, batch_pos)
+                    styled_prompt = self._canonicalize_prompt_for_daam(effective_prompt)
                     try:
                         global_heat_map = tracer.compute_global_heat_map(self.prompt_analyzer, styled_prompt, batch_pos)              
                     except Exception:

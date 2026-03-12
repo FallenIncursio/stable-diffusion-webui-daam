@@ -33,7 +33,7 @@ Notes:
 - Multi-word phrases are matched as one sequence (for example `white dress`).
 - You can separate attention targets with `,` or `BREAK`.
 - For Dynamic Prompts, DAAM matches against the resolved per-image prompt text.
-- For reliable DAAM matching with LoRA, place LoRA at the very end of the positive prompt, after terms you want to visualize.
+- DAAM normalizes extra-network tags (for example LoRA) for internal token mapping, so LoRA position (start/middle/end) should not change heatmap term matching.
 - For API generation, set `"save_images": true` so save hooks run and DAAM heatmaps are produced.
 
 ## Forge Notes
