@@ -50,7 +50,9 @@ Notes:
 - You can put Dynamic Prompts syntax directly in the DAAM attention box (variants/wildcards); DAAM will try to resolve it to the concrete token used in that image.
 - Variable/Jinja-heavy templates are handled best-effort. If a term cannot be uniquely resolved, diagnostics will show a miss reason.
 - DAAM normalizes extra-network tags (for example LoRA) for internal token mapping, so LoRA position (start/middle/end) should not change heatmap term matching.
-- For API generation, set `"save_images": true` so save hooks run and DAAM heatmaps are produced.
+- DAAM heatmaps are generated in the image-save callback (`on_before_image_saved`).
+- In WebUI, keep `Always save all generated images` enabled.
+- For API generation, set `"save_images": true`; otherwise no DAAM heatmaps are produced.
 - `All` means one aggregated heatmap over all denoising steps.
 - `Triplet` means three phase heatmaps (`Early`, `Mid`, `Late`) in one generation.
 - For `Triplet`, using `Use grid (output to grid dir)` is recommended for easier comparison.
