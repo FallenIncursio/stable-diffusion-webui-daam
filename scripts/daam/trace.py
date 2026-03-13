@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
-from typing import Type, Any, Dict
+from typing import Type, Any, Dict, Optional
 import math
 from modules.devices import device
 
@@ -29,6 +29,9 @@ from .utils import PromptAnalyzer
 
 __all__ = ['trace', 'DiffusionHeatMapHooker', 'HeatMap', 'MmDetectHeatMap']
 
+HeatMapByFactor = dict[int, list[torch.Tensor]]
+HeatMapByBatch = dict[int, HeatMapByFactor]
+
 
 def _resolve_diffusion_model(model):
     if hasattr(model, "model") and hasattr(model.model, "diffusion_model"):
@@ -47,13 +50,13 @@ class UNetForwardHooker(ObjectHooker[UNetModel]):
     def __init__(
         self,
         module: UNetModel,
-        heat_maps_cond: defaultdict(defaultdict),
-        heat_maps_uncond: defaultdict(defaultdict),
-        runtime_state: Dict[str, Any] = None,
+        heat_maps_cond: HeatMapByBatch,
+        heat_maps_uncond: HeatMapByBatch,
+        runtime_state: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(module)
-        self.all_heat_maps_cond = []
-        self.all_heat_maps_uncond = []
+        self.all_heat_maps_cond: list[HeatMapByBatch] = []
+        self.all_heat_maps_uncond: list[HeatMapByBatch] = []
         self.all_heat_maps = self.all_heat_maps_cond  # backward-compatible alias
         self.heat_maps_cond = heat_maps_cond
         self.heat_maps_uncond = heat_maps_uncond
@@ -90,7 +93,7 @@ class HeatMap:
         self.heat_maps = heat_maps
         self.prompt = prompt
 
-    def compute_word_heat_map(self, word: str, word_idx: int = None) -> torch.Tensor:
+    def compute_word_heat_map(self, word: str, word_idx: Optional[int] = None) -> Optional[torch.Tensor]:
         merge_idxs, _ = self.prompt_analyzer.calc_word_indecies(word)
         # print("merge_idxs", merge_idxs)
         if len(merge_idxs) == 0:
@@ -113,21 +116,26 @@ class MmDetectHeatMap:
                 bboxes[idx, :4] = np.array([x[0], y[0], x[-1] + 1, y[-1] + 1], dtype=np.float32)
 
         pred_file = Path(pred_file)
-        self.word_masks: Dict[str, torch.Tensor] = defaultdict(lambda: 0)
+        self.word_masks: Dict[str, torch.Tensor] = {}
         bbox_result, masks = torch.load(pred_file)
-        labels = [np.full(bbox.shape[0], i, dtype=np.int32) for i, bbox in enumerate(bbox_result)]
-        labels = np.concatenate(labels)
+        label_parts = [np.full(bbox.shape[0], i, dtype=np.int32) for i, bbox in enumerate(bbox_result)]
+        labels_np = np.concatenate(label_parts)
         bboxes = np.vstack(bbox_result)
 
         if masks is not None and bboxes[:, :4].sum() == 0:
             _compute_mask(masks, bboxes)
             scores = bboxes[:, -1]
             inds = scores > threshold
-            labels = labels[inds]
+            labels_np = labels_np[inds]
             masks = masks[inds, ...]
 
-            for lbl, mask in zip(labels, masks):
-                self.word_masks[COCO80_LABELS[lbl]] |= torch.from_numpy(mask)
+            for lbl, mask in zip(labels_np, masks):
+                key = COCO80_LABELS[lbl]
+                mask_tensor = torch.from_numpy(mask).bool()
+                if key in self.word_masks:
+                    self.word_masks[key] = torch.logical_or(self.word_masks[key].bool(), mask_tensor)
+                else:
+                    self.word_masks[key] = mask_tensor
 
             self.word_masks = {k: v.float() for k, v in self.word_masks.items()}
 
@@ -136,12 +144,21 @@ class MmDetectHeatMap:
 
 
 class DiffusionHeatMapHooker(AggregateHooker):
-    def __init__(self, model: LatentDiffusion, heigth : int, width : int, context_size : int = 77, weighted: bool = False, layer_idx: int = None, head_idx: int = None):
+    def __init__(
+        self,
+        model: LatentDiffusion,
+        heigth: int,
+        width: int,
+        context_size: int = 77,
+        weighted: bool = False,
+        layer_idx: Optional[int] = None,
+        head_idx: Optional[int] = None,
+    ):
         diffusion_model = _resolve_diffusion_model(model)
-        heat_maps_cond = defaultdict(lambda: defaultdict(list)) # batch index, factor, attention
-        heat_maps_uncond = defaultdict(lambda: defaultdict(list)) # batch index, factor, attention
+        heat_maps_cond: HeatMapByBatch = defaultdict(lambda: defaultdict(list))  # batch index, factor, attention
+        heat_maps_uncond: HeatMapByBatch = defaultdict(lambda: defaultdict(list))  # batch index, factor, attention
         runtime_state = {"cond_or_uncond": None}
-        modules = [
+        modules: list[Any] = [
             UNetCrossAttentionHooker(
                 x,
                 heigth,
@@ -184,13 +201,13 @@ class DiffusionHeatMapHooker(AggregateHooker):
         prompt_analyzer,
         prompt,
         batch_index,
-        time_weights=None,
-        time_idx=None,
-        last_n=None,
-        first_n=None,
-        factors=None,
+        time_weights: Optional[list[float]] = None,
+        time_idx: Optional[int] = None,
+        last_n: Optional[int] = None,
+        first_n: Optional[int] = None,
+        factors: Optional[list[int] | set[int]] = None,
         guidance_mode: str = "cond",
-    ):
+    ) -> Optional[HeatMap]:
         """
         Compute the global heat map for the given prompt, aggregating across time (inference steps) and space (different
         spatial transformer block heat maps).
@@ -216,9 +233,6 @@ class DiffusionHeatMapHooker(AggregateHooker):
         
         if time_weights is None:
             time_weights = [1.0] * len(all_heat_maps)
-
-        time_weights = np.array(time_weights)
-        time_weights /= time_weights.sum()
         if time_idx is not None:
             heat_maps = [all_heat_maps[time_idx]]
         else:
@@ -264,14 +278,14 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
     def __init__(
         self,
         module: CrossAttention,
-        img_height : int,
-        img_width : int,
-        heat_maps_cond: defaultdict(defaultdict),
-        heat_maps_uncond: defaultdict(defaultdict),
+        img_height: int,
+        img_width: int,
+        heat_maps_cond: HeatMapByBatch,
+        heat_maps_uncond: HeatMapByBatch,
         context_size: int = 77,
         weighted: bool = False,
-        head_idx: int = 0,
-        runtime_state: Dict[str, Any] = None,
+        head_idx: Optional[int] = None,
+        runtime_state: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(module)
         self.heat_maps = heat_maps_cond
@@ -317,8 +331,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         return best_h, best_w
         
     @torch.no_grad()
-    def _up_sample_attn(self, x, value, factor, method='bicubic'):
-        # type: (torch.Tensor, torch.Tensor, int, Literal['bicubic', 'conv']) -> torch.Tensor
+    def _up_sample_attn(self, x: torch.Tensor, value: torch.Tensor, factor: int, method: str = 'bicubic') -> torch.Tensor:
         # x shape: (heads, height * width, tokens)
         """
         Up samples the attention map in x using interpolation to the maximum size of (64, 64), as assumed in the Stable
@@ -343,7 +356,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         else:
             h_fix = max(1, int((h * w_fix) / w))
                 
-        maps = []
+        maps: list[torch.Tensor] = []
         x = x.permute(2, 0, 1)
         value = value.permute(1, 0, 2)
         weights = 1
@@ -361,12 +374,12 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         if self.weighted:
             weights = value.norm(p=1, dim=-1, keepdim=True).unsqueeze(-1)
 
-        maps = torch.stack(maps, 0)  # shape: (tokens, heads, height, width)
+        maps_tensor = torch.stack(maps, 0)  # shape: (tokens, heads, height, width)
         
         if self.head_idx:
-            maps = maps[:, self.head_idx:self.head_idx+1, :, :]
+            maps_tensor = maps_tensor[:, self.head_idx:self.head_idx+1, :, :]
 
-        return (weights * maps).sum(1, keepdim=True).cpu()
+        return (weights * maps_tensor).sum(1, keepdim=True).cpu()
     
     def _forward(hk_self, self, x, context=None, value=None, mask=None, additional_tokens=None, transformer_options=None, **kwargs):
         n_tokens_to_mask = 0
@@ -554,7 +567,7 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
         hidden_states = hk_self.reshape_batch_dim_to_heads(self, hidden_states)
         return hidden_states
 
-    def _align_context_tokens(self, map_attn_slice: torch.Tensor):
+    def _align_context_tokens(self, map_attn_slice: torch.Tensor) -> Optional[torch.Tensor]:
         target = self.context_size if isinstance(self.context_size, int) else 0
         if target <= 0:
             return map_attn_slice

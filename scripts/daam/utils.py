@@ -41,7 +41,13 @@ except ModuleNotFoundError:
 
 __all__ = ['expand_image', 'set_seed', 'escape_prompt', 'calc_context_size', 'compute_token_merge_indices', 'compute_token_merge_indices_with_tokenizer', 'image_overlay_heat_map', 'plot_overlay_heat_map', 'plot_mask_heat_map', 'PromptAnalyzer']
 
-def expand_image(im: torch.Tensor, h = 512, w = 512,  absolute: bool = False, threshold: float = None) -> torch.Tensor:
+def expand_image(
+    im: torch.Tensor,
+    h: int = 512,
+    w: int = 512,
+    absolute: bool = False,
+    threshold: float | None = None,
+) -> torch.Tensor:
 
     im = im.unsqueeze(0).unsqueeze(0)
     im = F.interpolate(im.float().detach(), size=(h, w), mode='bicubic')
@@ -56,7 +62,7 @@ def expand_image(im: torch.Tensor, h = 512, w = 512,  absolute: bool = False, th
 
     return im.squeeze()
 
-def _write_on_image(img, caption, font_size = 32):
+def _write_on_image(img: Image.Image, caption: str, font_size: int = 32) -> Image.Image:
     ix,iy = img.size
     draw = ImageDraw.Draw(img)
     margin=2
@@ -72,17 +78,25 @@ def _write_on_image(img, caption, font_size = 32):
     draw.text((int((ix-tx[2])/2),text_height), caption,(255,255,255),font=font)
     return img
 
-def image_overlay_heat_map(img, heat_map, word=None, out_file=None, crop=None, alpha=0.5, caption=None, image_scale=1.0):
-    # type: (Image.Image | np.ndarray, torch.Tensor, str, Path, int, float, str, float) -> Image.Image
+def image_overlay_heat_map(
+    img: Image.Image,
+    heat_map: torch.Tensor | None,
+    word: str | None = None,
+    out_file: Any = None,
+    crop: int | None = None,
+    alpha: float = 0.5,
+    caption: str | None = None,
+    image_scale: float = 1.0,
+) -> Image.Image:
     assert(img is not None)
 
     if heat_map is not None:
         heat_map = _convert_heat_map_colors(heat_map)
-        heat_map = heat_map.to('cpu').detach().numpy().copy().astype(np.uint8)
-        heat_map_img = Image.fromarray(heat_map)
+        heat_map_np = heat_map.to('cpu').detach().numpy().copy().astype(np.uint8)
+        heat_map_img = Image.fromarray(heat_map_np)
 
         if heat_map_img.size != img.size:
-            heat_map_img = heat_map_img.resize(img.size, Image.BICUBIC)
+            heat_map_img = heat_map_img.resize(img.size, Image.Resampling.BICUBIC)
         if heat_map_img.mode != img.mode:
             heat_map_img = heat_map_img.convert(img.mode)
 
@@ -96,36 +110,41 @@ def image_overlay_heat_map(img, heat_map, word=None, out_file=None, crop=None, a
     if image_scale != 1.0:
         x, y = img.size
         size = (int(x * image_scale), int(y * image_scale))
-        img = img.resize(size, Image.BICUBIC)
+        img = img.resize(size, Image.Resampling.BICUBIC)
 
     return img
 
 
-def _convert_heat_map_colors(heat_map : torch.Tensor):
+def _convert_heat_map_colors(heat_map: torch.Tensor) -> torch.Tensor:
     def get_color(value):
         return np.array(cm.turbo(value / 255)[0:3])
 
-    color_map = np.array([ get_color(i) * 255 for i in range(256) ])
-    color_map = torch.tensor(color_map, device=heat_map.device, dtype=dtype)
+    color_map_np = np.array([get_color(i) * 255 for i in range(256)])
+    color_map = torch.tensor(color_map_np, device=heat_map.device, dtype=dtype)
 
     heat_map = (heat_map * 255).long()
 
     return color_map[heat_map]
 
-def plot_overlay_heat_map(im, heat_map, word=None, out_file=None, crop=None):
-    # type: (Image.Image | np.ndarray, torch.Tensor, str, Path, int) -> None
+def plot_overlay_heat_map(
+    im: Image.Image,
+    heat_map: torch.Tensor,
+    word: str | None = None,
+    out_file: Any = None,
+    crop: int | None = None,
+) -> None:
     plt.clf()
     plt.rcParams.update({'font.size': 24})
 
-    im = np.array(im)
+    im_np = np.array(im)
     if crop is not None:
         heat_map = heat_map.squeeze()[crop:-crop, crop:-crop]
-        im = im[crop:-crop, crop:-crop]
+        im_np = im_np[crop:-crop, crop:-crop]
 
     plt.imshow(heat_map.squeeze().cpu().numpy(), cmap='jet')
-    im = torch.from_numpy(im).float() / 255
-    im = torch.cat((im, (1 - heat_map.unsqueeze(-1))), dim=-1)
-    plt.imshow(im)
+    im_tensor = torch.from_numpy(im_np).float() / 255
+    im_tensor = torch.cat((im_tensor, (1 - heat_map.unsqueeze(-1))), dim=-1)
+    plt.imshow(im_tensor.detach().cpu().numpy())
 
     if word is not None:
         plt.title(word)
@@ -134,11 +153,11 @@ def plot_overlay_heat_map(im, heat_map, word=None, out_file=None, crop=None):
         plt.savefig(out_file)
 
 
-def plot_mask_heat_map(im: Image.Image, heat_map: torch.Tensor, threshold: float = 0.4):
-    im = torch.from_numpy(np.array(im)).float() / 255
+def plot_mask_heat_map(im: Image.Image, heat_map: torch.Tensor, threshold: float = 0.4) -> None:
+    im_tensor = torch.from_numpy(np.array(im)).float() / 255
     mask = (heat_map.squeeze() > threshold).float()
-    im = im * mask.unsqueeze(-1)
-    plt.imshow(im)
+    im_tensor = im_tensor * mask.unsqueeze(-1)
+    plt.imshow(im_tensor.detach().cpu().numpy())
 
 
 def set_seed(seed: int) -> torch.Generator:
@@ -152,11 +171,11 @@ def set_seed(seed: int) -> torch.Generator:
 
     return gen
 
-def calc_context_size(token_length : int):
+def calc_context_size(token_length: int) -> int:
     len_check = 0 if (token_length - 1) < 0 else token_length - 1
     return ((int)(len_check // 75) + 1) * 77
 
-def escape_prompt(prompt):
+def escape_prompt(prompt: Any):
     if type(prompt) is str:
         prompt = prompt.lower()
         prompt = re.sub(r"[\(\)\[\]]", "", prompt)
@@ -169,17 +188,15 @@ def escape_prompt(prompt):
         return prompt_new
 
 
-def compute_token_merge_indices(model, prompt: str, word: str, word_idx: int = None):
+def compute_token_merge_indices(model: Any, prompt: str, word: str, word_idx: int | None = None):
 
-    clip = None
     tokenize = None
     wrapped = getattr(getattr(model, "cond_stage_model", None), "wrapped", None)
 
     if FrozenCLIPEmbedder is not None and isinstance(wrapped, FrozenCLIPEmbedder):
-        clip : FrozenCLIPEmbedder = model.cond_stage_model.wrapped
-        tokenize = clip.tokenizer.tokenize
+        wrapped_embedder = model.cond_stage_model.wrapped
+        tokenize = wrapped_embedder.tokenizer.tokenize
     elif FrozenOpenCLIPEmbedder is not None and isinstance(wrapped, FrozenOpenCLIPEmbedder):
-        clip : FrozenOpenCLIPEmbedder = model.cond_stage_model.wrapped
         tokenize = open_clip.tokenizer._tokenizer.encode
     elif wrapped is not None and hasattr(wrapped, "tokenizer"):
         tokenize = wrapped.tokenizer.tokenize
@@ -224,7 +241,13 @@ def compute_token_merge_indices(model, prompt: str, word: str, word_idx: int = N
 
     return idxs
 
-def compute_token_merge_indices_with_tokenizer(tokenizer, prompt: str, word: str, word_idx: int = None, limit : int = -1):
+def compute_token_merge_indices_with_tokenizer(
+    tokenizer: Any,
+    prompt: str,
+    word: str,
+    word_idx: int | None = None,
+    limit: int = -1,
+):
 
     escaped_prompt = escape_prompt(prompt)
     # escaped_prompt = re.sub(r"[_-]", " ", escaped_prompt)
@@ -285,8 +308,8 @@ class PromptAnalyzer:
         self.clip = clip
         self.is_open_clip = isinstance(clip, FrozenOpenCLIPEmbedderWithCustomWords)
         self.is_sdxl = isinstance(clip, GeneralConditioner)
-        self.used_custom_terms = []
-        self.hijack_comments = []
+        self.used_custom_terms: list[Any] = []
+        self.hijack_comments: list[Any] = []
         self.raw_text = text
         self.analysis_text = text
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import os
 import re
+from typing import Any, ClassVar
 
 from modules.shared import opts
 
@@ -35,6 +36,21 @@ except Exception:
 
 
 class AttentionResolverMixin:
+    DYNAMIC_RESOLVE_MAX_CANDIDATES: ClassVar[int] = 512
+    DYNAMIC_RESOLVE_MAX_WILDCARD_VALUES: ClassVar[int] = 4096
+    DYNAMIC_RESOLVE_CACHE_MAX_ENTRIES: ClassVar[int] = 4096
+    _break_regex: ClassVar[re.Pattern[str]] = re.compile(r"\bBREAK\b", flags=re.IGNORECASE)
+    _variant_block_regex: ClassVar[re.Pattern[str]] = re.compile(
+        r"\{[^{}]*\|[^{}]*\}|\[[^\[\]]*\|[^\[\]]*\]"
+    )
+    _wildcard_token_regex: ClassVar[re.Pattern[str]] = re.compile(r"__([A-Za-z0-9_\-./\\*\[\]?]+)__")
+    _extra_network_tag_regex: ClassVar[re.Pattern[str]] = re.compile(r"<[^<>:]+:[^<>]+>")
+    _invalid_filename_chars: ClassVar[re.Pattern[str]] = re.compile(r'[<>:"/\\|?*\x00-\x1F]+')
+    _dp_generator_cache_key: ClassVar[Any | None] = None
+    _dp_generator: ClassVar[Any | None] = None
+    _dp_wildcard_manager: ClassVar[Any | None] = None
+    _dp_resolve_cache: ClassVar[dict[str, list[str]]] = {}
+
     @classmethod
     def _split_attention_texts(cls, attention_texts: str):
         normalized = cls._break_regex.sub(",", attention_texts or "")
@@ -272,7 +288,7 @@ class AttentionResolverMixin:
         if wildcard_manager is not None and dp_parse is not None:
             try:
                 parsed = dp_parse(text, parser_config=parser_config) if parser_config is not None else dp_parse(text)
-                wildcard_names = set()
+                wildcard_names: set[str] = set()
                 cls._collect_wildcard_names_from_command(parsed, wildcard_names)
                 wildcard_budget = cls.DYNAMIC_RESOLVE_MAX_WILDCARD_VALUES
                 for wildcard_name in wildcard_names:

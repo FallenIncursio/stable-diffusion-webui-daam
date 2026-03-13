@@ -1,5 +1,6 @@
 from __future__ import annotations
 import re
+from typing import Any, ClassVar
 
 import gradio as gr
 import modules.images as images
@@ -83,10 +84,13 @@ class Script(
     _variant_block_regex = re.compile(r"\{[^{}]*\|[^{}]*\}|\[[^\[\]]*\|[^\[\]]*\]")
     _wildcard_token_regex = re.compile(r"__([A-Za-z0-9_\-./\\*\[\]?]+)__")
     _extra_network_tag_regex = re.compile(r"<[^<>:]+:[^<>]+>")
-    _dp_generator_cache_key = None
-    _dp_generator = None
-    _dp_wildcard_manager = None
-    _dp_resolve_cache = {}
+    _dp_generator_cache_key: ClassVar[Any] = None
+    _dp_generator: ClassVar[Any] = None
+    _dp_wildcard_manager: ClassVar[Any] = None
+    _dp_resolve_cache: ClassVar[dict[str, list[str]]] = {}
+    images: list[Any]
+    prompt_analyzers: list[utils.PromptAnalyzer]
+    negative_prompt_analyzers: list[utils.PromptAnalyzer]
     
 
     def title(self):

@@ -5,6 +5,12 @@ import os
 
 
 class DiagnosticsMixin:
+    def _contains_phrase(self, prompt: str, phrase: str) -> bool:
+        raise NotImplementedError
+
+    def _normalize_for_match(self, text: str) -> str:
+        raise NotImplementedError
+
     def _diagnose_missing_heatmap(self, raw_attention: str, resolved_attention: str, candidates, prompt_text: str, prompt_analyzer):
         if len(candidates) == 0:
             return "no_candidates"

@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import List, Generic, TypeVar, Any
 import functools
 import itertools
+from typing import Optional
 
 import torch.nn as nn
 
@@ -29,7 +30,7 @@ class ObjectHooker(Generic[ModuleType]):
     def __init__(self, module: ModuleType):
         self.module: ModuleType = module
         self.hooked = False
-        self.old_state = dict()
+        self.old_state: dict[str, Any] = dict()
 
     def __enter__(self):
         self.hook()
@@ -86,7 +87,7 @@ class AggregateHooker(ObjectHooker[ModuleListType]):
 
 
 class UNetCrossAttentionLocator(ModuleLocator[CrossAttention]):
-    def locate(self, model: UNetModel, layer_idx: int = None) -> List[CrossAttention]:
+    def locate(self, model: UNetModel, layer_idx: Optional[int] = None) -> List[CrossAttention]:
         """
         Locate all cross-attention modules in a UNetModel.
 

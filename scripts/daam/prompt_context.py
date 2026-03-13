@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import os
 import re
+from typing import ClassVar
 
 from scripts.daam.types import ParsedDaamFlags
 
 
 class PromptContextMixin:
+    saved_sample_count: int = 0
+    _warned_output_overlap: ClassVar[bool] = False
+
     @classmethod
     def _normalize_time_focus(cls, value):
         if not isinstance(value, str):
