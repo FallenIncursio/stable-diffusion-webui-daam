@@ -15,6 +15,33 @@ from PIL import Image
 
 from scripts.daam import trace, utils
 
+try:
+    from dynamicprompts.commands import (
+        SequenceCommand as DPSequenceCommand,
+        VariantCommand as DPVariantCommand,
+        WildcardCommand as DPWildcardCommand,
+    )
+    from dynamicprompts.commands.variable_commands import (
+        VariableAccessCommand as DPVariableAccessCommand,
+        VariableAssignmentCommand as DPVariableAssignmentCommand,
+    )
+    from dynamicprompts.commands.wrap_command import WrapCommand as DPWrapCommand
+    from dynamicprompts.generators import CombinatorialPromptGenerator as DPCombinatorialPromptGenerator
+    from dynamicprompts.parser.parse import ParserConfig as DPParserConfig
+    from dynamicprompts.parser.parse import parse as dp_parse
+    from dynamicprompts.wildcards import WildcardManager as DPWildcardManager
+except Exception:
+    DPSequenceCommand = None
+    DPVariantCommand = None
+    DPWildcardCommand = None
+    DPVariableAccessCommand = None
+    DPVariableAssignmentCommand = None
+    DPWrapCommand = None
+    DPCombinatorialPromptGenerator = None
+    DPParserConfig = None
+    DPWildcardManager = None
+    dp_parse = None
+
 before_image_saved_handler = None
 
 
@@ -67,12 +94,19 @@ class Script(scripts.Script):
     TIME_FOCUS_MID = "Mid"
     TIME_FOCUS_LATE = "Late"
     TIME_FOCUS_TRIPLET = "Triplet"
+    DYNAMIC_RESOLVE_MAX_CANDIDATES = 512
+    DYNAMIC_RESOLVE_MAX_WILDCARD_VALUES = 4096
+    DYNAMIC_RESOLVE_CACHE_MAX_ENTRIES = 4096
     _warned_output_overlap = False
     _invalid_filename_chars = re.compile(r'[<>:"/\\|?*\x00-\x1F]+')
     _break_regex = re.compile(r"\bBREAK\b", flags=re.IGNORECASE)
     _variant_block_regex = re.compile(r"\{[^{}]*\|[^{}]*\}|\[[^\[\]]*\|[^\[\]]*\]")
     _wildcard_token_regex = re.compile(r"__([A-Za-z0-9_\-./\\*\[\]?]+)__")
     _extra_network_tag_regex = re.compile(r"<[^<>:]+:[^<>]+>")
+    _dp_generator_cache_key = None
+    _dp_generator = None
+    _dp_wildcard_manager = None
+    _dp_resolve_cache = {}
     
 
     def title(self):
@@ -203,6 +237,163 @@ class Script(scripts.Script):
         return values
 
     @classmethod
+    def _get_dynamicprompts_parser_config(cls):
+        if DPParserConfig is None:
+            return None
+        try:
+            variant_start = getattr(opts, "dp_parser_variant_start", "{") or "{"
+            variant_end = getattr(opts, "dp_parser_variant_end", "}") or "}"
+            wildcard_wrap = getattr(opts, "dp_parser_wildcard_wrap", "__") or "__"
+            return DPParserConfig(
+                variant_start=variant_start,
+                variant_end=variant_end,
+                wildcard_wrap=wildcard_wrap,
+            )
+        except Exception:
+            return None
+
+    @classmethod
+    def _get_dynamicprompts_generator(cls):
+        if DPCombinatorialPromptGenerator is None or DPWildcardManager is None:
+            return None
+
+        parser_config = cls._get_dynamicprompts_parser_config()
+        wildcard_dirs = cls._get_wildcard_dirs()
+        wildcard_root = wildcard_dirs[0] if len(wildcard_dirs) > 0 else None
+        cache_key = (
+            wildcard_root,
+            getattr(parser_config, "variant_start", None),
+            getattr(parser_config, "variant_end", None),
+            getattr(parser_config, "wildcard_wrap", None),
+            bool(getattr(opts, "dp_ignore_whitespace", False)),
+        )
+
+        if cls._dp_generator is not None and cls._dp_generator_cache_key == cache_key:
+            return cls._dp_generator
+
+        try:
+            cls._dp_wildcard_manager = DPWildcardManager(wildcard_root) if wildcard_root else DPWildcardManager()
+            kwargs = {
+                "wildcard_manager": cls._dp_wildcard_manager,
+                "ignore_whitespace": bool(getattr(opts, "dp_ignore_whitespace", False)),
+            }
+            if parser_config is not None:
+                kwargs["parser_config"] = parser_config
+            cls._dp_generator = DPCombinatorialPromptGenerator(**kwargs)
+            cls._dp_generator_cache_key = cache_key
+            cls._dp_resolve_cache = {}
+            return cls._dp_generator
+        except Exception:
+            cls._dp_generator = None
+            cls._dp_wildcard_manager = None
+            cls._dp_generator_cache_key = None
+            return None
+
+    @classmethod
+    def _collect_wildcard_names_from_command(cls, command, names: set, depth: int = 0):
+        if command is None or depth > 12 or DPWildcardCommand is None:
+            return
+
+        if DPWildcardCommand is not None and isinstance(command, DPWildcardCommand):
+            wildcard = getattr(command, "wildcard", "")
+            if isinstance(wildcard, str):
+                wildcard = wildcard.strip()
+                if wildcard:
+                    names.add(wildcard)
+            else:
+                cls._collect_wildcard_names_from_command(wildcard, names, depth + 1)
+            wildcard_vars = getattr(command, "variables", None)
+            if isinstance(wildcard_vars, dict):
+                for value in wildcard_vars.values():
+                    cls._collect_wildcard_names_from_command(value, names, depth + 1)
+            return
+
+        if DPSequenceCommand is not None and isinstance(command, DPSequenceCommand):
+            for token in getattr(command, "tokens", []):
+                cls._collect_wildcard_names_from_command(token, names, depth + 1)
+            return
+
+        if DPVariantCommand is not None and isinstance(command, DPVariantCommand):
+            for option in getattr(command, "variants", []):
+                cls._collect_wildcard_names_from_command(getattr(option, "value", None), names, depth + 1)
+            return
+
+        if DPVariableAssignmentCommand is not None and isinstance(command, DPVariableAssignmentCommand):
+            cls._collect_wildcard_names_from_command(getattr(command, "value", None), names, depth + 1)
+            return
+
+        if DPVariableAccessCommand is not None and isinstance(command, DPVariableAccessCommand):
+            cls._collect_wildcard_names_from_command(getattr(command, "default", None), names, depth + 1)
+            return
+
+        if DPWrapCommand is not None and isinstance(command, DPWrapCommand):
+            cls._collect_wildcard_names_from_command(getattr(command, "wrapper", None), names, depth + 1)
+            cls._collect_wildcard_names_from_command(getattr(command, "inner", None), names, depth + 1)
+            return
+
+    @classmethod
+    def _dynamic_prompt_candidates(cls, text: str):
+        text = (text or "").strip()
+        if not text:
+            return []
+
+        cached = cls._dp_resolve_cache.get(text)
+        if isinstance(cached, list):
+            return list(cached)
+
+        candidates = []
+        generator = cls._get_dynamicprompts_generator()
+        wildcard_manager = cls._dp_wildcard_manager
+        parser_config = cls._get_dynamicprompts_parser_config()
+
+        if generator is not None:
+            try:
+                generated = generator.generate(text, cls.DYNAMIC_RESOLVE_MAX_CANDIDATES) or []
+                for value in generated:
+                    value = str(value).strip()
+                    if value:
+                        candidates.append(value)
+            except Exception:
+                pass
+
+        if wildcard_manager is not None and dp_parse is not None:
+            try:
+                parsed = dp_parse(text, parser_config=parser_config) if parser_config is not None else dp_parse(text)
+                wildcard_names = set()
+                cls._collect_wildcard_names_from_command(parsed, wildcard_names)
+                wildcard_budget = cls.DYNAMIC_RESOLVE_MAX_WILDCARD_VALUES
+                for wildcard_name in wildcard_names:
+                    if wildcard_budget <= 0:
+                        break
+                    values = wildcard_manager.get_all_values(wildcard_name)
+                    for value in values:
+                        value = str(value).strip()
+                        if not value:
+                            continue
+                        candidates.append(value)
+                        wildcard_budget -= 1
+                        if wildcard_budget <= 0:
+                            break
+            except Exception:
+                pass
+
+        deduped = []
+        seen = set()
+        for candidate in candidates:
+            key = cls._normalize_for_match(candidate)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+            if len(deduped) >= cls.DYNAMIC_RESOLVE_MAX_WILDCARD_VALUES:
+                break
+
+        if len(cls._dp_resolve_cache) >= cls.DYNAMIC_RESOLVE_CACHE_MAX_ENTRIES:
+            cls._dp_resolve_cache.clear()
+        cls._dp_resolve_cache[text] = deduped
+        return list(deduped)
+
+    @classmethod
     def _resolve_variant_blocks(cls, text: str, prompt: str):
         def _replace(match: re.Match):
             token = match.group(0)
@@ -212,7 +403,14 @@ class Script(scripts.Script):
             best = cls._best_prompt_match(prompt, options)
             return best if best is not None else options[0]
 
-        return cls._variant_block_regex.sub(_replace, text)
+        prev = None
+        resolved = text
+        loops = 0
+        while resolved != prev and loops < 16:
+            prev = resolved
+            resolved = cls._variant_block_regex.sub(_replace, resolved)
+            loops += 1
+        return resolved
 
     @classmethod
     def _resolve_wildcard_tokens(cls, text: str, prompt: str):
@@ -227,17 +425,37 @@ class Script(scripts.Script):
         return cls._wildcard_token_regex.sub(_replace, text)
 
     @classmethod
-    def _resolve_attention_term(cls, raw_attention: str, prompt: str):
+    def _resolve_attention_and_candidates(cls, raw_attention: str, prompt: str):
         attention = (raw_attention or "").strip()
         if not attention:
-            return ""
+            return "", []
         if not prompt:
-            return cls._break_regex.sub(" ", attention).strip()
+            simple = cls._break_regex.sub(" ", attention).strip()
+            return simple, [simple] if simple else []
+
         resolved = cls._resolve_variant_blocks(attention, prompt)
         resolved = cls._resolve_wildcard_tokens(resolved, prompt)
         resolved = cls._break_regex.sub(" ", resolved)
         resolved = re.sub(r"\s+", " ", resolved).strip(" ,")
-        return resolved if resolved else attention
+        resolved = resolved if resolved else attention
+
+        candidates = cls._attention_candidates(raw_attention, resolved)
+        best_dynamic = cls._best_prompt_match(prompt, cls._dynamic_prompt_candidates(attention))
+        if best_dynamic:
+            resolved = best_dynamic
+            candidates = cls._attention_candidates(raw_attention, resolved)
+        else:
+            best = cls._best_prompt_match(prompt, candidates)
+            if best:
+                resolved = best
+                candidates = cls._attention_candidates(raw_attention, resolved)
+
+        return resolved, candidates
+
+    @classmethod
+    def _resolve_attention_term(cls, raw_attention: str, prompt: str):
+        resolved, _ = cls._resolve_attention_and_candidates(raw_attention, prompt)
+        return resolved
 
     @classmethod
     def _attention_candidates(cls, raw_attention: str, resolved_attention: str):
@@ -251,10 +469,16 @@ class Script(scripts.Script):
                 piece = piece.strip()
                 if piece:
                     candidates.append(piece)
+        for dynamic_candidate in cls._dynamic_prompt_candidates(raw_attention):
+            candidates.append(dynamic_candidate)
+            for piece in re.split(r",", cls._break_regex.sub(",", dynamic_candidate)):
+                piece = piece.strip()
+                if piece:
+                    candidates.append(piece)
         deduped = []
         seen = set()
         for candidate in candidates:
-            key = candidate.lower()
+            key = cls._normalize_for_match(candidate)
             if candidate and key not in seen:
                 seen.add(key)
                 deduped.append(candidate)
@@ -1245,8 +1469,9 @@ class Script(scripts.Script):
                                 if influence_mode == self.INFLUENCE_NEGATIVE and styled_negative_prompt
                                 else styled_prompt
                             )
-                            attention = self._resolve_attention_term(raw_attention, resolve_base_prompt)
-                            attn_candidates = self._attention_candidates(raw_attention, attention)
+                            attention, attn_candidates = self._resolve_attention_and_candidates(
+                                raw_attention, resolve_base_prompt
+                            )
 
                             img_size = params.image.size
                             attn_caption = self.attn_captions[i] if i < len(self.attn_captions) else ""

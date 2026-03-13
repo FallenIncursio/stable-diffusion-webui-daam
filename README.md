@@ -6,9 +6,12 @@ This extension is a WebUI script port of [DAAM](https://github.com/castorini/daa
 
 - Attention heatmaps for comma-separated target phrases.
 - `BREAK` is also treated as a separator in attention text input.
-- Dynamic Prompts term resolution for attention targets:
-  - Variant blocks like `{red eyes|blue eyes}` / `[red eyes|blue eyes]`
-  - Wildcard tokens like `__eye_color__` (resolved against wildcard files)
+- Dynamic Prompts-aware term resolution for attention targets:
+  - Nested variants, e.g. `{{bunnygirl outfit|cat girl}|school girl}`
+  - Weighted/ranged variants, e.g. `{0.2::red eyes|0.8::blue eyes}`, `{1-2$$ and $$a|b|c}`
+  - Sampler-prefixed variants, e.g. `{~hands up|arms crossed}`, `{@a|b}`
+  - Wildcards and wildcard globbing, e.g. `__artists__`, `__artists*__`
+  - Uses Dynamic Prompts parser + wildcard manager when available, with legacy fallback resolver
 - Explicit `Enable DAAM` toggle (on/off like other always-on scripts).
 - Time-focus controls with explicit on/off:
   - `Enable time focus`
@@ -43,7 +46,9 @@ Notes:
 
 - Multi-word phrases are matched as one sequence (for example `white dress`).
 - You can separate attention targets with `,` or `BREAK`.
-- For Dynamic Prompts, DAAM matches against the resolved per-image prompt text.
+- For Dynamic Prompts, DAAM resolves attention templates against the resolved per-image prompt text.
+- You can put Dynamic Prompts syntax directly in the DAAM attention box (variants/wildcards); DAAM will try to resolve it to the concrete token used in that image.
+- Variable/Jinja-heavy templates are handled best-effort. If a term cannot be uniquely resolved, diagnostics will show a miss reason.
 - DAAM normalizes extra-network tags (for example LoRA) for internal token mapping, so LoRA position (start/middle/end) should not change heatmap term matching.
 - For API generation, set `"save_images": true` so save hooks run and DAAM heatmaps are produced.
 - `All` means one aggregated heatmap over all denoising steps.
