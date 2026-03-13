@@ -1,10 +1,8 @@
 from __future__ import annotations
 from itertools import chain
-from functools import lru_cache
-from pathlib import Path
 import random
 import re
-from typing import Union, Any
+from typing import Any
 
 from PIL import Image, ImageFont, ImageDraw
 # from fonts.ttf import Roboto
@@ -79,8 +77,6 @@ def image_overlay_heat_map(img, heat_map, word=None, out_file=None, crop=None, a
     assert(img is not None)
 
     if heat_map is not None:
-        shape : torch.Size = heat_map.shape
-        # heat_map = heat_map.unsqueeze(-1).expand(shape[0], shape[1], 3).clone()
         heat_map = _convert_heat_map_colors(heat_map)
         heat_map = heat_map.to('cpu').detach().numpy().copy().astype(np.uint8)
         heat_map_img = Image.fromarray(heat_map)
@@ -276,18 +272,6 @@ def compute_token_merge_indices_with_tokenizer(tokenizer, prompt: str, word: str
             idxs.append(x + 1 + seq*2) # If tokens exceed 75, they are split.
 
     return idxs
-
-nlp = None
-
-
-@lru_cache(maxsize=100000)
-def cached_nlp(prompt: str, type='en_core_web_md'):
-    global nlp
-
-#    if nlp is None:
-#       nlp = spacy.load(type)
-
-    return nlp(prompt)
 
 class PromptAnalyzer:
     class _SimpleChunk:

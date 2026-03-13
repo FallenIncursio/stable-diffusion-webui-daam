@@ -366,11 +366,6 @@ class AttentionResolverMixin:
         return resolved, candidates
 
     @classmethod
-    def _resolve_attention_term(cls, raw_attention: str, prompt: str):
-        resolved, _ = cls._resolve_attention_and_candidates(raw_attention, prompt)
-        return resolved
-
-    @classmethod
     def _attention_candidates(cls, raw_attention: str, resolved_attention: str):
         candidates = []
         for term in (resolved_attention, raw_attention):

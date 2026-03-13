@@ -9,7 +9,8 @@ from modules import script_callbacks
 from modules.processing import StableDiffusionProcessing, fix_seed
 from modules.shared import opts
 
-from scripts.daam import trace, utils
+from scripts.daam import utils
+from scripts.daam.trace import trace
 from scripts.daam.attention_resolver import AttentionResolverMixin
 from scripts.daam.diagnostics import DiagnosticsMixin
 from scripts.daam.prompt_context import PromptContextMixin
@@ -387,7 +388,7 @@ class Script(
         _, self.enable_time_focus, self.time_focus, self.enable_diagnostics, self.influence_mode, _ = self._parse_optional_daam_flags(
             enable_daam, extra_args, **kwargs
         )
-        if self.enabled == False:
+        if not self.enabled:
             return
 
         # ADetailer calls `scripts.postprocess(copy(p), Processed(..., images=[]))`
@@ -402,11 +403,6 @@ class Script(
         self.tracers = None
         self.deferred_cleanup = False
         self.run_active = False
-        
-        initial_info = None
-
-        if initial_info is None:
-            initial_info = processed.info
             
         self.images += processed.images
 

@@ -84,9 +84,6 @@ class AggregateHooker(ObjectHooker[ModuleListType]):
         for h in self.module:
             h.unhook()
 
-    def register_hook(self, hook: ObjectHooker):
-        self.module.append(hook)
-
 
 class UNetCrossAttentionLocator(ModuleLocator[CrossAttention]):
     def locate(self, model: UNetModel, layer_idx: int = None) -> List[CrossAttention]:

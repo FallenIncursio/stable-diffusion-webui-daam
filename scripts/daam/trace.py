@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
-from typing import List, Type, Any, Literal, Dict
+from typing import Type, Any, Dict
 import math
 from modules.devices import device
 
@@ -19,12 +19,12 @@ import numba
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
+from torch import einsum
 from einops import rearrange, repeat
 
-from .experiment import COCO80_LABELS
+from .labels import COCO80_LABELS
 from .hook import ObjectHooker, AggregateHooker, UNetCrossAttentionLocator
-from .utils import compute_token_merge_indices, PromptAnalyzer
+from .utils import PromptAnalyzer
 
 
 __all__ = ['trace', 'DiffusionHeatMapHooker', 'HeatMap', 'MmDetectHeatMap']
@@ -170,14 +170,6 @@ class DiffusionHeatMapHooker(AggregateHooker):
     @property
     def all_heat_maps(self):
         return self.forward_hook.all_heat_maps_cond
-
-    @property
-    def all_heat_maps_positive(self):
-        return self.forward_hook.all_heat_maps_cond
-
-    @property
-    def all_heat_maps_negative(self):
-        return self.forward_hook.all_heat_maps_uncond
     
     def reset(self):
         for module in self.module:
@@ -199,7 +191,6 @@ class DiffusionHeatMapHooker(AggregateHooker):
         factors=None,
         guidance_mode: str = "cond",
     ):
-        # type: (PromptAnalyzer, str, int, int, int, int, int, List[float]) -> HeatMap
         """
         Compute the global heat map for the given prompt, aggregating across time (inference steps) and space (different
         spatial transformer block heat maps).
@@ -593,10 +584,6 @@ class UNetCrossAttentionHooker(ObjectHooker[CrossAttention]):
 
     def _hook_impl(self):
         self.monkey_patch('forward', self._forward)
-
-    @property
-    def num_heat_maps(self):
-        return len(next(iter(self.heat_maps.values())))
 
 
 trace: Type[DiffusionHeatMapHooker] = DiffusionHeatMapHooker
